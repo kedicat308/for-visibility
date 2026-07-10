@@ -1,86 +1,97 @@
 # frr-visible
 
-给 FRR 容器体外套一层 **gNMI 壳**:事件驱动 ingester 把 FRR/内核状态灌进一棵 OpenConfig
-cache,对外用 gNMI Subscribe 暴露。设计详见 `../frr-visible.md`。
+**EN** — A **gNMI shim** that wraps an FRR container: event-driven ingesters feed FRR/kernel state into an OpenConfig cache, exposed over gNMI (Subscribe / Get / Capabilities). It makes an FRR box *look like* a gNMI-speaking router-switch without modifying FRR. Full design in [`design.md`](design.md).
 
-## 当前进度:FPM(转发面)+ BMP(控制面),L3VPN 双视图已打通
+**中** — 给 FRR 容器体外套一层 **gNMI 壳**:事件驱动 ingester 把 FRR/内核状态灌进一棵 OpenConfig cache,对外用 gNMI(Subscribe / Get / Capabilities)暴露。不改 FRR,让它"看起来像"会说 gNMI 的路由交换机。完整设计见 [`design.md`](design.md)。
+
+## Architecture / 架构
 
 ```
-zebra FPM(事件) ─┐
-bgpd BMP(事件) ──┤→ ingesters → internal/state/cache.go(openconfig/gnmi cache,"cache 居中")
-                  │            → internal/gnmiserver(subscribe.Server:ONCE + STREAM/ON_CHANGE)
-                  │            → gNMI 客户端
+FRR daemons ─ BMP (BGP/L3VPN) ──┐
+            ─ FPM (routes/FIB) ─┤
+kernel ─ netlink (if/vlan/fdb) ─┤→ ingesters → internal/state (openconfig/gnmi cache, "cache-centric")
+       ─ cgroup (cpu/mem) ──────┤            → internal/gnmiserver (Subscribe + Get + Capabilities)
+lldpd ─ lldpcli ────────────────┤            → gNMI client (gnmic, Telegraf, CloudVision, …)
+ospfd ─ syslog ─────────────────┘
 ```
 
-同一条 VPN 路由,控制面 + 转发面在一棵 cache 对齐:
-- 控制面(BMP):`frr:/bgp-rib/afi-safis/afi-safi[name=l3vpn-ipv4-unicast]/routes/route[rd][prefix]/state/{label,route-target,next-hop,peer}`
-- 转发面(FPM):`openconfig:/network-instances/network-instance[name=<vrf>]/afts/ipv4-unicast/ipv4-entry[prefix]/state/next-hop`
-- 邻居(BMP): `openconfig:/network-instances/.../bgp/neighbors/neighbor[neighbor-address]/state/{session-state,peer-as}`
+**EN** — Event-driven where the kernel/protocol pushes (netlink multicast, FPM, BMP, syslog, lldpd); SAMPLE only for true gauges (counters, CPU/mem) — same as commercial NOS. Three origins share one cache: `openconfig` (standard), `host` (container, not in OC), `frr` (L3VPN RD/RT/label OC covers poorly).
 
-已验证:VRF 名解析、nexthop 解析、RD/RT/label 提取、接口状态/计数/FDB、live 加路由秒级 ON_CHANGE。
+**中** — 凡是内核/协议主动推的就事件驱动(netlink 组播、FPM、BMP、syslog、lldpd);只有真正的 gauge(计数、CPU/内存)才 SAMPLE——和商用 NOS 一致。三个 origin 共用一棵 cache:`openconfig`(标准)、`host`(容器,OC 没有)、`frr`(L3VPN 的 RD/RT/label,OC 覆盖弱)。
 
-指标覆盖(8/8 均有 ingester):1 CPU/内存 ✅ · 2 端口状态/流量 ✅ · 3 VLAN/FDB ✅ · 4 MPLS(FIB) · 5 OSPF ✅ · 6 BGP ✅ · 7 LLDP ✅ · 8 L3VPN ✅(控制面+转发面)。
-三个 origin 均有真实数据:`openconfig`(接口/BGP/L3VPN-FIB/LLDP)· `frr`(L3VPN 控制面 RD/RT/label)· `host`(容器 CPU/内存)。
+## Metric coverage / 指标覆盖 (8/8)
 
-### 踩坑记录(部署/测试)
-- **bind-mount 文件的 inode 坑**:`go build -o` 生成新 inode,`-v file:/x` 绑的是旧 inode,容器看不到新构建 → 改用 `docker cp` 更新容器内二进制。
-- **lldpcli watch 块缓冲**:stdout 是管道时 libc 块缓冲,事件延迟 → 加 15s 周期 reconcile 兜底(LLDP 变化慢,足够)。
-- LLDP 需与 lldpd 同 mount ns(lldpcli 走 Unix socket);测试时把 shim 二进制跑进带 lldpd 的容器内。
-- **⚠️ /dev/log 回压死锁(重要)**:shim 绑 `/dev/log`(unix datagram,**可靠投递**)当 syslog 接收器,若读得慢(如对每条消息内联 fork vtysh),接收缓冲满 → FRR 的 `syslog()` **阻塞** → 拖垮所有 daemon(vtysh 挂死)。**监控壳绝不能拖垮被监控者**。修复:syslog 读循环只**持续排空** + 非阻塞发信号,独立 worker **去抖后**才 reconcile,并 `SetReadBuffer(1MB)`。**生产建议**:改用「FRR `log file` + inotify tail」——写方(FRR)追加文件永不阻塞,彻底消除回压风险(待做)。
+| # | Metric / 指标 | Ingester | Path (origin) |
+|---|------|----------|------|
+| 1 | Container CPU/mem / 容器 CPU·内存 | cgroup | `host:/container/{cpu,memory}/state/*` |
+| 2 | Port status/traffic / 端口状态·流量 | netlink | `openconfig:/interfaces/interface/state{,/counters}` |
+| 3 | VLAN / FDB | netlink | `openconfig:/network-instances/.../fdb/mac-table` |
+| 4 | MPLS FIB | fpm | `openconfig:/network-instances/.../afts` |
+| 5 | OSPF neighbors / OSPF 邻居 | ospf (syslog) | `openconfig:/network-instances/.../ospfv2/.../neighbor` |
+| 6 | BGP neighbors / BGP 邻居 | bmp | `openconfig:/network-instances/.../bgp/neighbors/neighbor` |
+| 7 | LLDP | lldp | `openconfig:/lldp/interfaces/.../neighbor` |
+| 8 | MPLS L3VPN | bmp + fpm | control: `frr:/bgp-rib/.../route[rd][prefix]` · forwarding: `openconfig:.../afts` |
 
-## 目录
+**EN** — For one VPN route, control plane (BMP: RD/RT/label) and forwarding plane (FPM: VRF FIB) align in the same cache — the core value.
+**中** — 同一条 VPN 路由,控制面(BMP:RD/RT/label)和转发面(FPM:VRF FIB)在同一棵 cache 对齐——核心价值。
 
-- `cmd/frr-visible` — 主程序(cache + gNMI server + FPM + BMP ingester)
-- `cmd/subtest`    — 验证用 gNMI Subscribe 客户端(`-once`/STREAM,`-origin`,`-path`)
-- `internal/state` — OpenConfig cache 封装
-- `internal/gnmiserver` — gNMI 服务端:Subscribe(复用 openconfig subscribe)+ Get + Capabilities;Set 待做
-- `internal/ingest/fpm.go` — FPM ingester(转发面:路由 + nexthop-group 解析)
-- `internal/ingest/bmp.go` — BMP ingester(控制面:peer 状态 + VPNv4 路由/RD/RT/label)
-- `internal/ingest/netlink.go` — netlink ingester(接口状态 ON_CHANGE / 计数 SAMPLE / FDB)
-- `internal/ingest/lldp.go` — LLDP ingester(lldpcli watch 触发 + json reconcile + 15s 兜底)
-- `internal/ingest/cgroup.go` — cgroup ingester(容器 CPU/内存,host origin,SAMPLE)
-- `internal/ingest/ospf.go` — OSPF ingester(syslog /dev/log 触发 + vtysh reconcile,解耦排空+去抖)
-- `internal/ingest/vrf.go` — VRF table→名 解析(netlink)
+## gNMI RPC coverage / gNMI RPC 覆盖
 
-## 构建 / 运行(在 my-frr VM 内,Go 1.24+)
+- ✅ **Subscribe** — streaming telemetry (STREAM/ONCE + ON_CHANGE/SAMPLE) / 流式遥测
+- ✅ **Get** — one-shot snapshot, verified on all 3 origins with gnmic / 一次性快照,三 origin 均经 gnmic 实测
+- ✅ **Capabilities** — model/encoding discovery / 模型·编码发现
+- ⬜ **Set** — config push; the only remaining piece (write side, higher risk) / 配置下发,唯一剩余(写侧,风险高)
+
+## Layout / 目录
+
+- `cmd/frr-visible` — main program (cache + gNMI server + all ingesters) / 主程序
+- `cmd/subtest` — tiny gNMI Subscribe test client (`-once`/STREAM, `-origin`, `-path`) / 验证客户端
+- `internal/state` — OpenConfig cache wrapper / cache 封装
+- `internal/gnmiserver` — gNMI server: Subscribe + Get + Capabilities / gNMI 服务端
+- `internal/ingest/fpm.go` — routes / VRF FIB + nexthop-group parsing / 转发面
+- `internal/ingest/bmp.go` — BGP peer state + VPNv4 routes (RD/RT/label) / 控制面
+- `internal/ingest/netlink.go` — interface status (ON_CHANGE) / counters (SAMPLE) / FDB
+- `internal/ingest/lldp.go` — lldpcli watch trigger + json reconcile + 15s fallback
+- `internal/ingest/cgroup.go` — container CPU/memory (host origin, SAMPLE)
+- `internal/ingest/ospf.go` — OSPF neighbors via syslog trigger + vtysh reconcile
+- `internal/ingest/vrf.go` — VRF table-id → name (netlink)
+- `lab/` — reproducible L3VPN test lab (pe1/pe2 configs + run scripts) / 可复现测试环境
+
+## Build / Run / 构建·运行
+
+Go 1.24+. Deploy either **embedded** (shim inside the FRR container — CPU/mem = FRR container, lldpcli/vtysh reachable) or **sidecar** (`--network container:<frr>`, shares netns).
+构建需 Go 1.24+。部署可选**嵌入式**(shim 跑在 FRR 容器内——CPU/内存即 FRR 容器,lldpcli/vtysh 可达)或 **sidecar**(`--network container:<frr>`,共享 netns)。
 
 ```bash
-cd /Users/fanwei/arista/frr-visible
 CGO_ENABLED=0 go build -o /tmp/frr-visible ./cmd/frr-visible
 CGO_ENABLED=0 go build -o /tmp/subtest     ./cmd/subtest
 
-# sidecar:与 FRR 共享 netns(方案 B),这样 netlink 能读到 VRF 设备
-docker run -d --name shim --network container:pe1 --privileged \
-  -v /tmp/frr-visible:/frr-visible:ro --entrypoint /frr-visible \
-  alpine -gnmi :9339 -fpm 127.0.0.1:2620 -bmp 127.0.0.1:5000 -target frr
+# embedded: run the shim inside the FRR container / 嵌入式:shim 跑进 FRR 容器
+docker cp /tmp/frr-visible pe1:/shim
+docker exec -d pe1 sh -c "/shim -gnmi :9339 -fpm 127.0.0.1:2620 -bmp 127.0.0.1:5000 -target frr"
 
-# FRR 侧把 FPM / BMP 指向本地(同 netns)
-docker exec pe1 vtysh -c "conf t" -c "fpm address 127.0.0.1 port 2620"
-docker exec pe1 vtysh -c "conf t" -c "router bgp 65000" -c "bmp targets T1" \
-  -c "bmp connect 127.0.0.1 port 5000 min-retry 1000 max-retry 5000"
+# point FRR's FPM/BMP at the shim, enable OSPF syslog / 把 FRR 的 FPM/BMP 指向 shim,开 OSPF syslog
+docker exec pe1 vtysh -c "conf t" -c "fpm address 127.0.0.1 port 2620" \
+  -c "router bgp 65000" -c "bmp targets T1" -c "bmp connect 127.0.0.1 port 5000 min-retry 1000 max-retry 5000"
+docker exec pe1 vtysh -c "conf t" -c "log syslog informational" -c "router ospf" -c "log-adjacency-changes detail"
 
-# 订阅验证:转发面(openconfig AFT)/ 控制面(frr bgp-rib)
-docker run --rm --network pelab -v /tmp/subtest:/subtest:ro --entrypoint /subtest \
-  alpine -a 172.30.0.11:9339 -target frr -origin openconfig -path network-instances -once
-docker run --rm --network pelab -v /tmp/subtest:/subtest:ro --entrypoint /subtest \
-  alpine -a 172.30.0.11:9339 -target frr -origin frr -path bgp-rib -once
+# query with the real gnmic client / 用真实 gnmic 客户端查询
+gnmic -a 172.30.0.11:9339 --insecure capabilities
+gnmic -a 172.30.0.11:9339 --insecure get --path "openconfig:/interfaces/interface[name=eth0]/state/oper-status"
+gnmic -a 172.30.0.11:9339 --insecure get --path "frr:/bgp-rib/afi-safis/afi-safi[name=l3vpn-ipv4-unicast]/routes"
 ```
 
-## 已知 TODO
+Reproduce the L3VPN test lab / 复现 L3VPN 测试环境: see `lab/run2.sh` (OSPF+LDP underlay, iBGP VPNv4, cust VRF on each PE).
 
-- ✅ ~~next-hop 解析~~:已跟踪 RTM_NEWNEXTHOP 对象 + RTA_NH_ID,解析真实下一跳 / blackhole。
-- ✅ ~~VRF 名映射~~:sidecar 共享 netns 后用 vishvananda/netlink 读 VRF 设备,table id→名(cust/cust2)。
-- **origin**:客户端需用 `origin=openconfig` 订阅(OC 树);`host`/`frr` 私有树待加。
-- 仅 IPv4 路由 next-hop 单值落 cache;IPv6、多下一跳、MPLS-LFIB(AF_MPLS)、更多 AFT 字段待补。
+## Gotchas / 踩坑记录
 
-## gNMI RPC 覆盖
+- **⚠️ /dev/log back-pressure deadlock / 回压死锁 (important)** — Binding `/dev/log` (unix datagram, *reliable* delivery) as a syslog sink: if the reader is slow (e.g. inline `fork vtysh` per message), the receive buffer fills and FRR's `syslog()` **blocks**, wedging every daemon (vtysh hangs). **A monitor must never harm the monitored.** Fix: the syslog loop only *drains* + non-blocking signal; a separate debounced worker reconciles; `SetReadBuffer(1MB)`. Production: prefer `FRR log file` + inotify tail (the writer never blocks). / shim 绑 `/dev/log`(可靠投递)读得慢会阻塞 FRR 的 `syslog()` 拖垮 daemon。修复=解耦排空+去抖 worker+1MB 缓冲。生产建议改「log file + inotify」。
+- **bind-mount inode trap / inode 坑** — `go build -o` makes a new inode; `-v file:/x` binds the old one, so the container runs the stale binary. Use `docker cp`. / 用 `docker cp` 更新容器内二进制。
+- **lldpcli watch block-buffering / 块缓冲** — its stdout block-buffers over a pipe; a 15s periodic reconcile is the safety net. / 加 15s 周期兜底。
+- **LLDP needs same mount ns as lldpd** (lldpcli uses a Unix socket). / LLDP 需与 lldpd 同 mount ns。
 
-- ✅ **Subscribe**(STREAM/ONCE + ON_CHANGE/SAMPLE)—— 流式遥测
-- ✅ **Get**(一次性快照,三个 origin 均验证:openconfig/host/frr)—— gnmic 实测
-- ✅ **Capabilities**(版本/模型/编码发现)—— gnmic 实测
-- ⬜ **Set**(配置下发)—— 唯一剩余;写侧,风险高,从低风险子集起步
+## Next / 下一步
 
-## 下一步
-
-Set(配置下发)—— 从只读遥测走向可配置。
-OSPF syslog 可选硬化为「log file + inotify」(消除 /dev/log 回压风险)。
+- **Set** (config push) — turn the read-only monitor into a configurable target; start from a low-risk subset (L2 first, not BGP/OSPF core). / 配置下发,从低风险子集起步。
+- Harden OSPF syslog to `log file` + inotify. / OSPF syslog 硬化为 log file + inotify。
+- IPv6 / multi-nexthop / AF_MPLS LFIB / more AFT fields. / IPv6、多下一跳、AF_MPLS LFIB、更多 AFT 字段。
