@@ -641,3 +641,17 @@ path:  ce1 -> pe1 -> p1 -> p2 -> pe2 -> ce4
 ```
 
 与 vtysh 版 `pathtrace.sh` 逐跳一致,双向对称(反向 ce4→ce1 用标签 19→16)。`pathtrace.sh`(登设备)保留为离线兜底,`pathtrace-gnmi.sh` 是统一的、免登设备的正版。
+
+### 15.5 path trace 上看板(2026-07-11,已实测)
+
+把 on-demand 的 trace 变成**持续指标**,进 Prometheus + Grafana。三支柱里 trace 支柱的"数据面 path trace"这半落地。
+
+**`cmd/pathtrace-exporter`(Go,直连 gNMI,不依赖 gnmic/bash)**:周期(15s)对配置的**流**跑一遍 §15.4 的 gNMI 走法(地址建 ip→node、通配 VRF 的 AFT 做 LPM、走 LFIB),把结果吐成 Prometheus 文本、自服务 `/metrics`。所以能塞进任意最小容器(alpine 无 bash 也行)。
+- 配置(env):`INVENTORY`(node=mgmtIP,…)、`FLOWS`(name:startNode>dstIP,…)、`INTERVAL`、`LISTEN`。
+- 指标:`frr_pathtrace_reachable{flow,src,dst}`、`frr_pathtrace_hops{...}`、`frr_pathtrace_duration_seconds{...}`、`frr_pathtrace_hop_info{flow,seq,node,kind,nexthop,labels,detail}=1`(每跳一条 series,`kind`∈ ip / ip-push / mpls-swap / mpls-pop-php / mpls-pop-vrf / dest / drop)。
+
+**部署**(`setup-telemetry.sh` 已并入,幂等):exporter 容器**双挂**——`frr-mgmt`(172.31.0.31,够到 8 个 shim :9339)+ `campus-mgmt`(172.30.30.21,让 Prometheus 抓 :9808),与 `gnmic-frr` 同套路。Prometheus 加 `pathtrace-exporter` job;看板加一行 **Trace**:`Flow reachable`(1=OK 背景红绿)、`Hops per flow`、`Current path — per hop`(表,按 flow+seq 排序,逐跳 node/kind/next-hop/labels/detail)。
+
+**实测**:3 条流(ce1→ce4 / ce4→ce1 / ce2→ce3)均 reachable=1、hops=7,`hop_info` 逐跳与 §15.4 一致;Prometheus `sum(frr_pathtrace_reachable)=3`。看板 `FRR-visible`(Mac 上 http://localhost:3000/d/frr-visible)。这样一条路径断在哪一跳/哪个 VRF、标签栈怎么变,看板上直接可见,还能告警(reachable→0)。
+
+> 下一步(紧随):**convergence trace**——控制面收敛事件的跨进程+跨设备因果时间线(link flap → netlink/ospf-syslog/BMP/FPM 四总线按 prefix 关联成 span),补齐 trace 支柱的另一半。见对话记录的设计。

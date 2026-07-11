@@ -15,6 +15,22 @@ docker run -d --name gnmic-frr --network frr-mgmt --ip 172.31.0.30 \
 docker network connect campus-mgmt gnmic-frr --ip 172.30.30.20
 echo "gnmic-frr started (frr-mgmt 172.31.0.30 + campus-mgmt 172.30.30.20)"
 
+# 1b. pathtrace-exporter — gNMI-native path trace as Prometheus metrics. Runs the
+#     same walk as pathtrace-gnmi.sh for configured flows; dual-homed like gnmic-frr
+#     (frr-mgmt to reach the shims, campus-mgmt so Prometheus can scrape :9808).
+SRC=/Users/fanwei/arista/frr-visible
+INV="pe1=172.31.0.11,pe2=172.31.0.12,p1=172.31.0.21,p2=172.31.0.22,ce1=172.31.0.101,ce2=172.31.0.102,ce3=172.31.0.103,ce4=172.31.0.104"
+FLOWS="${PATHTRACE_FLOWS:-ce1-ce4:ce1>10.255.1.4,ce4-ce1:ce4>10.255.1.1,ce2-ce3:ce2>10.255.1.3}"
+( cd "$SRC" && CGO_ENABLED=0 GOFLAGS=-buildvcs=false go build -o /tmp/pathtrace-exporter ./cmd/pathtrace-exporter )
+docker rm -f pathtrace-exporter >/dev/null 2>&1 || true
+docker run -d --name pathtrace-exporter --network frr-mgmt --ip 172.31.0.31 \
+  -v /tmp/pathtrace-exporter:/pathtrace-exporter:ro \
+  -e INVENTORY="$INV" -e FLOWS="$FLOWS" -e INTERVAL=15s -e LISTEN=":9808" \
+  --entrypoint /pathtrace-exporter --restart unless-stopped \
+  ghcr.io/openconfig/gnmic:latest >/dev/null
+docker network connect campus-mgmt pathtrace-exporter --ip 172.30.30.21
+echo "pathtrace-exporter started (frr-mgmt 172.31.0.31 + campus-mgmt 172.30.30.21); flows: $FLOWS"
+
 # 2. Prometheus scrape job for gnmic-frr (idempotent)
 if ! grep -q "gnmic-frr" "$TELEM/prometheus.yml"; then
   cat >> "$TELEM/prometheus.yml" <<'EOF'
@@ -27,6 +43,16 @@ EOF
   echo "added gnmic-frr scrape job"
 else
   echo "prometheus scrape job already present"
+fi
+if ! grep -q "pathtrace-exporter" "$TELEM/prometheus.yml"; then
+  cat >> "$TELEM/prometheus.yml" <<'EOF'
+
+  # gNMI-native path trace (frr-visible)
+  - job_name: pathtrace-exporter
+    static_configs:
+      - targets: ['pathtrace-exporter:9808']
+EOF
+  echo "added pathtrace-exporter scrape job"
 fi
 
 # 3. Provision the dashboard into Grafana

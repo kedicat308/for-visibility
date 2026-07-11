@@ -1,6 +1,6 @@
 {
   "uid": "frr-visible",
-  "title": "FRR-visible — 5-node MPLS L3VPN (gNMI shim)",
+  "title": "FRR-visible — 8-node MPLS L3VPN (gNMI shim)",
   "tags": ["frr", "gnmi", "shim"],
   "timezone": "browser",
   "schemaVersion": 39,
@@ -150,6 +150,30 @@
       "targets": [ { "refId": "A", "expr": "count(openconfig_network_instances_network_instance_afts_ipv4_unicast_ipv4_entry_state_next_hop{source=~\"$node\"}) by (source)", "instant": true, "legendFormat": "{{source}}" } ],
       "options": { "orientation": "horizontal", "displayMode": "gradient" },
       "fieldConfig": { "defaults": { "color": { "mode": "continuous-BlPu" } } }
+    },
+    { "type": "row", "title": "Trace · gNMI path trace (frr-visible)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 56 }, "id": 50 },
+    {
+      "id": 51, "type": "stat", "title": "Flow reachable (1=OK) / 流可达",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 12, "x": 0, "y": 57 },
+      "targets": [ { "refId": "A", "expr": "frr_pathtrace_reachable", "instant": true, "legendFormat": "{{flow}}" } ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "textMode": "value_and_name", "orientation": "horizontal" },
+      "fieldConfig": { "defaults": { "mappings": [ { "type": "value", "options": { "0": { "text": "DOWN", "color": "red" }, "1": { "text": "OK", "color": "green" } } } ], "thresholds": { "mode": "absolute", "steps": [ { "color": "red", "value": null }, { "color": "green", "value": 1 } ] } } }
+    },
+    {
+      "id": 52, "type": "stat", "title": "Hops per flow / 每流跳数",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 5, "w": 12, "x": 12, "y": 57 },
+      "targets": [ { "refId": "A", "expr": "frr_pathtrace_hops", "instant": true, "legendFormat": "{{flow}}" } ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "textMode": "value_and_name", "orientation": "horizontal" },
+      "fieldConfig": { "defaults": { "color": { "mode": "continuous-BlPu" } } }
+    },
+    {
+      "id": 53, "type": "table", "title": "Current path — per hop (node / kind / next-hop / labels) / 当前路径逐跳",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 11, "w": 24, "x": 0, "y": 62 },
+      "targets": [ { "refId": "A", "expr": "frr_pathtrace_hop_info", "instant": true, "format": "table" } ],
+      "transformations": [ { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true, "Value": true }, "indexByName": { "flow": 0, "seq": 1, "node": 2, "kind": 3, "nexthop": 4, "labels": 5, "detail": 6 }, "renameByName": { "nexthop": "next-hop" } } }, { "id": "sortBy", "options": { "fields": {}, "sort": [ { "field": "flow" }, { "field": "seq" } ] } } ]
     }
   ]
 }
