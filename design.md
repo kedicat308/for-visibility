@@ -755,3 +755,25 @@ path:  ce1 -> pe1 -> p1 -> p2 -> pe2 -> ce4
 **实测**:pe1 出 `10.0.21.2/10.0.22.2 vrf=cust`,pe2 出 `10.0.23.2/10.0.24.2 vrf=cust`,iBGP 仍 `default`;全网 BGP 邻居 10 条、全 ESTABLISHED、无 `0.0.0.0`。看板 BGP 邻居面板新增 **vrf 列**(原来 exclude 掉了)并按 node→vrf 排序,default iBGP 与 per-VRF PE-CE 一眼可分。
 
 **顺带记**(同日):看板 **FIB/MPLS 转发表**里"prefix 全是 0.0.0.0/0"是误会——后端 116 条路由、39 个不同 prefix 完全健康,`0.0.0.0/0` 只是各节点经 `172.31.0.254` 管理网关的默认路由(每节点 1 条,扎眼)。已在面板 query 加 `ipv4_entry_prefix!~"^(0.0.0.0/0|172.31..*)$"` 滤掉管理网噪声 + 按 node/prefix 排序,只留核心/L3VPN 转发(含 vrf=cust 客户路由)。
+
+### 15.10 多层拓扑:一张节点图叠五层(2026-07-11,已实测出图)
+
+一台路由器本质是**多层拓扑叠在同一批节点上**,每层的"边"来自不同数据源——全都在我们已采的遥测里。`cmd/topology-exporter`(复用 pathtrace-exporter 的 gNMI+Prometheus 骨架,**直读各 shim gNMI、不依赖 gnmic 订阅**)把五层都吐成 Node-Graph-ready 指标 `frr_topo_node{layer,id,title,role}` / `frr_topo_edge{layer,id,source,target,detail}`:
+
+| 层 | 边的来源 | 对端标识 → 归一 |
+|----|---------|----------------|
+| **physical** | LLDP `system-name` | 本身就是节点名 |
+| **vlan** | bridge/FDB(`fdb/mac-table`) | 交换机--`vlan:<id>`--`mac:<addr>` 伪节点;L2 局部于网桥、**不跨 L3 核心** |
+| **ospf** | OSPF `adjacency-state==FULL` | 接口名 `<self>-<peer>` 直接编码对端(免 router-id 映射) |
+| **bgp** | BGP `session-state==ESTABLISHED` | peer IP → 节点(读各节点接口地址建 IP→name);**iBGP=跨核心逻辑边**,PE-CE 带 vrf |
+| **mpls** | LFIB(`frr:/mpls/lfib/entry`) | next-hop IP / 出接口 → 下游 LSR;标签交换传输段 |
+
+**关键设计点**:
+- **归一化在 Go 里做**——各层对端标识不同(节点名/router-id/IP/MAC),这正是 PromQL `label_join` 做不到的(只能拼现有标签、不能 IP→名字映射),所以必须要个 exporter,而不是纯查询。
+- **节点从边的端点推导**(不是遍历 inventory),vlan/mac 伪节点因此自然出现,孤立点自动消失。
+- **无向去重**:一条会话两端各上报一次,按有序 pair 去重;BGP 两端 vrf 可能不一致(PE 报 cust、CE 报 default),合并时**保留非 default 的**,顺序无关。
+- **inventory 白名单**挡掉 LFIB egress-pop 指向 VRF 设备(`cust`)误当节点;vlan 层单独走 `addPseudo` 放行伪节点。
+
+**Grafana**:一个 `nodeGraph` 面板 + `layer` 自定义变量(physical/vlan/ospf/bgp/mpls);两条 instant table query `frr_topo_node{layer="$layer"}` / `frr_topo_edge{layer="$layer"}`,organize 把 `role`/`detail` 改名成 `mainstat` 供 Node Graph 显示。**Prometheus instant 每 series 一帧,前端 format:table 合成单帧**——Node Graph 靠字段名自动区分 nodes(有 `id`)/edges(有 `id`+`source`+`target`)。
+
+**验证靠 Grafana image-renderer**(单独容器 `grafana/grafana-image-renderer`,Grafana 加 `GF_RENDERING_SERVER_URL`/`CALLBACK_URL` 环境变量;`/render/d-solo/...&panelId=60&var-layer=X` 出 PNG)——五层全部实测出图:physical 7 边、vlan 6、ospf 3、bgp 5(含 pe1↔pe2 iBGP 逻辑边清晰可见)、mpls 3。**坑**:provisioning 的看板文件会在 grafana 重启时覆盖 API 推的改动——改看板要走"改仓库 JSON → 拷 `provisioning/dashboards/` → 重启 grafana",别只 API push。新增容器:`topology-exporter`(双挂 172.31.0.33/172.30.30.23)。
