@@ -138,8 +138,8 @@
       "id": 42, "type": "table", "title": "FIB / MPLS forwarding (AFT next-hop) / 转发表",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 9, "w": 12, "x": 12, "y": 41 },
-      "targets": [ { "refId": "A", "expr": "openconfig_network_instances_network_instance_afts_ipv4_unicast_ipv4_entry_state_next_hop{source=~\"$node\"}", "instant": true, "format": "table" } ],
-      "transformations": [ { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true, "target": true, "subscription_name": true, "Value": true }, "renameByName": { "source": "node", "network_instance_name": "vrf", "ipv4_entry_prefix": "prefix", "next_hop": "next-hop" } } } ]
+      "targets": [ { "refId": "A", "expr": "openconfig_network_instances_network_instance_afts_ipv4_unicast_ipv4_entry_state_next_hop{source=~\"$node\",ipv4_entry_prefix!~\"^(0.0.0.0/0|172.31..*)$\"}", "instant": true, "format": "table" } ],
+      "transformations": [ { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true, "target": true, "subscription_name": true, "Value": true }, "renameByName": { "source": "node", "network_instance_name": "vrf", "ipv4_entry_prefix": "prefix", "next_hop": "next-hop" } } }, { "id": "sortBy", "options": { "fields": {}, "sort": [ { "field": "node" }, { "field": "prefix" } ] } } ]
     },
     {
       "id": 43, "type": "table", "title": "Bridge FDB / MAC table (VLAN) / 二层转发表",
