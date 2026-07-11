@@ -57,6 +57,20 @@ func (r *VRFResolver) Name(table uint32) string {
 	return fmt.Sprintf("table:%d", table)
 }
 
+// NonDefaultNames returns the names of all VRF devices in the current netns
+// (i.e. every network-instance other than the default table). Refreshes first so
+// a VRF configured after startup is seen.
+func (r *VRFResolver) NonDefaultNames() []string {
+	r.Refresh()
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	names := make([]string, 0, len(r.m))
+	for _, n := range r.m {
+		names = append(names, n)
+	}
+	return names
+}
+
 func (r *VRFResolver) lookup(table uint32) (string, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

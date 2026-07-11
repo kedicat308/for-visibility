@@ -15,6 +15,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
 
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 
@@ -26,9 +27,15 @@ type BMP struct {
 	addr string
 	c    *state.Cache
 	cor  *correlate.Correlator
+
+	vrf   *VRFResolver      // resolves an RD to a VRF name when the wire omits it
+	mu    sync.Mutex        // guards rdVRF (default + per-VRF targets dial in concurrently)
+	rdVRF map[string]string // Route-Distinguisher -> VRF name, learned once per RD
 }
 
-func NewBMP(addr string, c *state.Cache) *BMP { return &BMP{addr: addr, c: c} }
+func NewBMP(addr string, c *state.Cache) *BMP {
+	return &BMP{addr: addr, c: c, vrf: NewVRFResolver(), rdVRF: map[string]string{}}
+}
 
 // SetCorrelator wires the convergence-trace correlator (optional).
 func (b *BMP) SetCorrelator(cor *correlate.Correlator) { b.cor = cor }
@@ -103,42 +110,128 @@ func (b *BMP) handle(conn net.Conn) {
 	}
 }
 
-// perPeer parses the 42-byte Per-Peer Header.
-func perPeer(body []byte) (peer net.IP, peerAS uint32, ok bool) {
+// perPeer parses the 42-byte Per-Peer Header (RFC 7854 §4.2).
+//
+//	off 0     Peer Type (0 global, 1 RD-instance, 2 local-instance, 3 loc-rib)
+//	off 1     Peer Flags (bit0x80 = V: peer address is IPv6)
+//	off 2..9  Peer Distinguisher (RD when the peer lives in a non-default VRF)
+//	off 10..25 Peer Address, off 26..29 Peer AS
+func perPeer(body []byte) (peer net.IP, peerAS uint32, ptype byte, rd string, ok bool) {
 	if len(body) < bmpPerPeerLen {
-		return nil, 0, false
+		return nil, 0, 0, "", false
 	}
+	ptype = body[0]
 	flags := body[1]
+	if !allZero(body[2:10]) {
+		rd = formatRD(body[2:10])
+	}
 	if flags&0x80 != 0 { // V flag set -> IPv6
 		peer = net.IP(append([]byte(nil), body[10:26]...))
 	} else {
 		peer = net.IP(append([]byte(nil), body[22:26]...))
 	}
 	peerAS = binary.BigEndian.Uint32(body[26:30])
-	return peer, peerAS, true
+	return peer, peerAS, ptype, rd, true
+}
+
+func allZero(b []byte) bool {
+	for _, x := range b {
+		if x != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (b *BMP) peerState(body []byte, up bool) {
-	peer, peerAS, ok := perPeer(body)
+	peer, peerAS, _, rd, ok := perPeer(body)
 	if !ok || peer.IsUnspecified() {
 		// Skip the Loc-RIB / unspecified peer (RFC 9069): it has no real neighbor
 		// address and would otherwise surface as a bogus 0.0.0.0 BGP neighbor.
 		return
 	}
+	// A non-empty Distinguisher (RD) means the peer lives in a non-default VRF
+	// (FRR sets Peer Type=1 / RD-instance for PE-CE eBGP in `router bgp .. vrf X`).
+	// Resolve the RD to a VRF name so the neighbor is filed under the same
+	// network-instance the FPM AFT uses (e.g. "cust"), learning it once per RD:
+	//   1. the Peer Up VRF/Table Name TLV (RFC 9069) when FRR sends it (authoritative);
+	//   2. else the node's sole non-default VRF device (a PE usually has one per RD);
+	//   3. else fall back to the RD string as the instance name.
+	vrf := "default"
+	if rd != "" {
+		b.mu.Lock()
+		name, ok := b.rdVRF[rd]
+		b.mu.Unlock()
+		if !ok {
+			if up {
+				name = peerUpVRF(body)
+			}
+			if name == "" {
+				if names := b.vrf.NonDefaultNames(); len(names) == 1 {
+					name = names[0]
+				}
+			}
+			if name != "" {
+				b.mu.Lock()
+				b.rdVRF[rd] = name
+				b.mu.Unlock()
+			} else {
+				name = rd
+			}
+		}
+		vrf = name
+	}
 	st := "ESTABLISHED"
 	if !up {
 		st = "IDLE"
 	}
-	ups := []*gnmipb.Update{leafUpdate(neighborElems(peer.String(), "session-state"), st)}
+	ups := []*gnmipb.Update{leafUpdate(neighborElems(vrf, peer.String(), "session-state"), st)}
 	if up && peerAS != 0 {
-		ups = append(ups, leafUpdate(neighborElems(peer.String(), "peer-as"), strconv.FormatUint(uint64(peerAS), 10)))
+		ups = append(ups, leafUpdate(neighborElems(vrf, peer.String(), "peer-as"), strconv.FormatUint(uint64(peerAS), 10)))
 	}
 	_ = b.c.Update("openconfig", ups, nil)
-	log.Printf("[bmp] peer %s %s (as=%d)", peer, st, peerAS)
+	log.Printf("[bmp] peer %s %s vrf=%s (as=%d)", peer, st, vrf, peerAS)
+}
+
+// peerUpVRF extracts the VRF/Table Name (RFC 9069 Information TLV type 3) from a
+// BMP Peer Up message body (which starts with the 42-byte per-peer header).
+// Layout after the header: Local Address(16) + Local Port(2) + Remote Port(2) +
+// Sent OPEN + Received OPEN + Information TLVs. Returns "" when absent.
+func peerUpVRF(body []byte) string {
+	if len(body) < bmpPerPeerLen {
+		return ""
+	}
+	p := body[bmpPerPeerLen:]
+	if len(p) < 20 {
+		return ""
+	}
+	p = p[20:]               // skip local address + local/remote port
+	for i := 0; i < 2; i++ { // skip Sent OPEN, then Received OPEN
+		if len(p) < bgpHdrLen {
+			return ""
+		}
+		l := int(binary.BigEndian.Uint16(p[16:18]))
+		if l < bgpHdrLen || l > len(p) {
+			return ""
+		}
+		p = p[l:]
+	}
+	for len(p) >= 4 { // Information TLVs: type(2) len(2) value
+		t := binary.BigEndian.Uint16(p[0:2])
+		l := int(binary.BigEndian.Uint16(p[2:4]))
+		if 4+l > len(p) {
+			break
+		}
+		if t == 3 { // VRF/Table Name
+			return string(p[4 : 4+l])
+		}
+		p = p[4+l:]
+	}
+	return ""
 }
 
 func (b *BMP) routeMon(body []byte) {
-	peer, _, ok := perPeer(body)
+	peer, _, _, _, ok := perPeer(body)
 	if !ok {
 		return
 	}
@@ -305,13 +398,13 @@ func leafUpdate(elems []*gnmipb.PathElem, val string) *gnmipb.Update {
 	return &gnmipb.Update{Path: &gnmipb.Path{Elem: elems}, Val: strVal(val)}
 }
 
-// openconfig: /network-instances/network-instance[name=default]/protocols/
+// openconfig: /network-instances/network-instance[name=vrf]/protocols/
 //
 //	protocol[identifier=BGP][name=bgp]/bgp/neighbors/neighbor[neighbor-address=peer]/state/<leaf>
-func neighborElems(peer, leaf string) []*gnmipb.PathElem {
+func neighborElems(vrf, peer, leaf string) []*gnmipb.PathElem {
 	return []*gnmipb.PathElem{
 		{Name: "network-instances"},
-		{Name: "network-instance", Key: map[string]string{"name": "default"}},
+		{Name: "network-instance", Key: map[string]string{"name": vrf}},
 		{Name: "protocols"},
 		{Name: "protocol", Key: map[string]string{"identifier": "BGP", "name": "bgp"}},
 		{Name: "bgp"},

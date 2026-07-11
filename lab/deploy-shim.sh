@@ -60,6 +60,17 @@ for n in "${!ASN[@]}"; do
     -c '  bmp monitor ipv4 vpn pre-policy' \
     -c '  bmp monitor ipv4 vpn post-policy' >/dev/null 2>&1 || true
 done
+# PE-CE eBGP sessions live in `router bgp 65000 vrf cust`; that instance needs its
+# own bmp target so the shim sees the CE neighbors (bmp targets are per-instance).
+for n in pe1 pe2; do
+  docker exec "$n" vtysh \
+    -c 'configure terminal' \
+    -c 'router bgp 65000 vrf cust' \
+    -c ' bmp targets T1' \
+    -c '  bmp connect 127.0.0.1 port 5000 min-retry 1000 max-retry 5000' \
+    -c '  bmp monitor ipv4 unicast pre-policy' \
+    -c '  bmp monitor ipv4 unicast post-policy' >/dev/null 2>&1 || true
+done
 # OSPF adjacency changes -> syslog -> shim /dev/log
 for n in $OSPF_NODES; do
   docker exec "$n" vtysh -c 'configure terminal' -c 'log syslog informational' >/dev/null 2>&1 || true
