@@ -737,3 +737,21 @@ path:  ce1 -> pe1 -> p1 -> p2 -> pe2 -> ce4
 **边界**:`trace_id` 仍是 §15.7 的时间聚类重建、非传播——Tempo 只换了存储 + UI,不改变这一事实;Zipkin span 的 duration 用"到下一 hop 的间隔"(点状事件的近似)。
 
 **三支柱在 Grafana 闭环**:**metrics**(`pathtrace-exporter`→Prometheus,看板 Trace 行)+ **logs**(daemon syslog→Loki)+ **traces**(convergence→Tempo)。看板上 `pathtrace reachable→0` 告警 → 跳同一时刻的 Tempo 收敛瀑布 → 再跳对应节点 syslog,metrics→trace→logs 串起排障。**查看**:Grafana `http://localhost:3000` → Explore → 选 Tempo → Search(TraceQL `{}`,或 `{ name =~ "convergence.*" }`)或直接输 `trace_id`。
+
+### 15.9 BMP 邻居的 VRF 归属:PE-CE eBGP 上表(2026-07-11,已实测)
+
+**问题**:看板 BGP 邻居只见 PE 之间的 iBGP(default),看不到 PE→CE 的 eBGP。根因是 **`bmp targets` 是 per-BGP-instance 的**——`deploy-shim.sh` 只在默认实例 `router bgp 65000` 配了 BMP,而 PE-CE 会话住在 `router bgp 65000 vrf cust`,那个实例没 BMP,壳自然收不到。
+
+**修法两段**:
+1. **配**:给 PE 的 `router bgp 65000 vrf cust` 也加一套 `bmp targets T1 / bmp connect 127.0.0.1 port 5000 / bmp monitor ipv4 unicast pre|post-policy`(每实例独立 target)。
+2. **解析**:BMP **Per-Peer Header** 对非默认 VRF 的 peer 会把 **Peer Type=1(RD-instance)**、**Peer Distinguisher(off 2..9)= 该 VRF 的 RD**(实测 ce1/ce2=`65000:1`,ce3/ce4=`65000:2`)。`perPeer` 解析出 RD,`peerState` 把 neighbor 归到对应 network-instance,而非死写 `default`。
+
+**RD→VRF 名怎么来(分层,login-free)**:
+- ① 优先读 **Peer Up 的 VRF/Table Name TLV(RFC 9069 type 3)**——**但实测这版 FRR 的 Peer Up 不带**(消息在 sent/received OPEN 后即止,OPEN 里只有 FQDN capability 带主机名 `pe1`/`ce1`);
+- ② 退而用 **`VRFResolver.NonDefaultNames()`**:PE 上非默认 VRF 唯一时,任意非默认 RD 直接映射到它(得 `cust`),与 FPM AFT 用的 vrf 名一致;
+- ③ 再退化成 RD 字符串当实例名。
+每个 RD 只解析一次并缓存(`rdVRF` map + mutex,因默认实例与 VRF 实例两条 BMP 连接并发 dial-in)。
+
+**实测**:pe1 出 `10.0.21.2/10.0.22.2 vrf=cust`,pe2 出 `10.0.23.2/10.0.24.2 vrf=cust`,iBGP 仍 `default`;全网 BGP 邻居 10 条、全 ESTABLISHED、无 `0.0.0.0`。看板 BGP 邻居面板新增 **vrf 列**(原来 exclude 掉了)并按 node→vrf 排序,default iBGP 与 per-VRF PE-CE 一眼可分。
+
+**顺带记**(同日):看板 **FIB/MPLS 转发表**里"prefix 全是 0.0.0.0/0"是误会——后端 116 条路由、39 个不同 prefix 完全健康,`0.0.0.0/0` 只是各节点经 `172.31.0.254` 管理网关的默认路由(每节点 1 条,扎眼)。已在面板 query 加 `ipv4_entry_prefix!~"^(0.0.0.0/0|172.31..*)$"` 滤掉管理网噪声 + 按 node/prefix 排序,只留核心/L3VPN 转发(含 vrf=cust 客户路由)。
