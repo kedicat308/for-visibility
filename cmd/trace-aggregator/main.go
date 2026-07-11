@@ -12,12 +12,16 @@
 package main
 
 import (
+	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -50,9 +54,11 @@ var (
 	window    = 1500 * time.Millisecond
 	interval  = 3 * time.Second
 	listen    = ":9341"
+	zipkinURL = "" // TEMPO_ZIPKIN, e.g. http://tempo:9411/api/v2/spans; empty disables export
 
-	mu  sync.RWMutex
-	out []dtrace
+	pushed = map[string]bool{} // trace_ids already exported to Tempo
+	mu     sync.RWMutex
+	out    []dtrace
 )
 
 func main() {
@@ -72,6 +78,7 @@ func main() {
 	if v := os.Getenv("LISTEN"); v != "" {
 		listen = v
 	}
+	zipkinURL = os.Getenv("TEMPO_ZIPKIN")
 	if len(inventory) == 0 {
 		log.Fatal("need INVENTORY (node=mgmtIP,...)")
 	}
@@ -94,6 +101,11 @@ func loop() {
 		mu.Lock()
 		out = dt
 		mu.Unlock()
+		if zipkinURL != "" {
+			for i := range dt {
+				pushZipkin(cl, dt[i])
+			}
+		}
 		time.Sleep(interval)
 	}
 }
@@ -225,4 +237,74 @@ func parseInventory(s string) map[string]string {
 		}
 	}
 	return m
+}
+
+// ---- Tempo export (Zipkin v2 spans; no OTel SDK needed) ----
+
+type zEndpoint struct {
+	ServiceName string `json:"serviceName"`
+}
+
+type zSpan struct {
+	TraceID       string            `json:"traceId"`
+	ID            string            `json:"id"`
+	ParentID      string            `json:"parentId,omitempty"`
+	Name          string            `json:"name"`
+	Timestamp     int64             `json:"timestamp"` // epoch micros
+	Duration      int64             `json:"duration"`  // micros
+	LocalEndpoint zEndpoint         `json:"localEndpoint"`
+	Tags          map[string]string `json:"tags,omitempty"`
+}
+
+func hexID(seed string, n int) string {
+	h := sha256.Sum256([]byte(seed))
+	return hex.EncodeToString(h[:n])
+}
+
+// pushZipkin exports one distributed trace to Tempo as Zipkin v2 spans, exactly
+// once per trace_id. The dtrace becomes a root span; each hop becomes a child
+// span timestamped at its absolute time and tagged with its owning node — so
+// Grafana renders the cross-device waterfall natively.
+func pushZipkin(cl *http.Client, dt dtrace) {
+	seed := dt.Start.Format(time.RFC3339Nano) + "|" + dt.Link + "|" + strings.Join(dt.Roots, ";")
+	traceID := hexID(seed, 16) // 16 bytes -> 32 hex
+	if pushed[traceID] {
+		return
+	}
+	rootID := hexID(traceID+"|root", 8)
+	name := "convergence"
+	if dt.Link != "" {
+		name += " " + dt.Link
+	}
+	spans := []zSpan{{
+		TraceID: traceID, ID: rootID, Name: name,
+		Timestamp: dt.Start.UnixMicro(), Duration: dt.SpanMs*1000 + 1,
+		LocalEndpoint: zEndpoint{ServiceName: "network"},
+		Tags:          map[string]string{"link": dt.Link, "nodes": strings.Join(dt.Nodes, ","), "roots": strings.Join(dt.Roots, " | ")},
+	}}
+	for i, s := range dt.Spans {
+		abs := dt.Start.Add(time.Duration(s.OffsetMs) * time.Millisecond)
+		dur := int64(1000)
+		if i+1 < len(dt.Spans) {
+			if g := (dt.Spans[i+1].OffsetMs - s.OffsetMs) * 1000; g > dur {
+				dur = g
+			}
+		}
+		spans = append(spans, zSpan{
+			TraceID: traceID, ID: hexID(traceID+"|"+strconv.Itoa(i), 8), ParentID: rootID,
+			Name:      s.Bus + "/" + s.Kind,
+			Timestamp: abs.UnixMicro(), Duration: dur,
+			LocalEndpoint: zEndpoint{ServiceName: s.Node},
+			Tags:          map[string]string{"key": s.Key, "detail": s.Detail},
+		})
+	}
+	b, _ := json.Marshal(spans)
+	resp, err := cl.Post(zipkinURL, "application/json", bytes.NewReader(b))
+	if err != nil {
+		log.Printf("zipkin push %s: %v", traceID, err)
+		return
+	}
+	resp.Body.Close()
+	pushed[traceID] = true
+	log.Printf("exported dtrace #%d -> tempo (trace_id=%s, %d spans)", dt.ID, traceID, len(spans))
 }

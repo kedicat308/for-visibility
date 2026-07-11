@@ -720,4 +720,20 @@ path:  ce1 -> pe1 -> p1 -> p2 -> pe2 -> ce4
 - **因果靠时间聚类重建**(window 1.5s),非传播的 trace-id;窗口大小是"聚全 vs 误并不同事件"的权衡。
 - **依赖跨设备时钟同步**:本 lab 所有容器同宿主机同内核时钟,故 start 对齐到亚毫秒;**真实多设备网络需 NTP/PTP**,聚类窗口要相应放大。这是把此法用于生产的关键前提。
 - churn 阈值(span≥3)会滤掉变化极少的过路节点(实测 p2 只变 2 条→未计入),是"抓收敛 vs 抑噪音"的取舍。
-- **正式化下一步**:correlator 出 **OTLP span** → **Tempo**,则 Grafana 直接渲染这张跨设备瀑布(真正的分布式追踪 UI),并可与 metrics(pathtrace-exporter)、logs(syslog/Loki)在同一看板联动——路由器版三支柱闭环。
+- **正式化**:把这些 dtrace 推给 **Tempo**,Grafana 直接渲染跨设备瀑布——**已落地,见 §15.8**。
+
+### 15.8 接 Tempo:distributed trace 进 Grafana(2026-07-11,已实测)
+
+把 §15.7 的 dtrace 从"命令行 ASCII 瀑布"升级成 **Grafana 里可点、可联动的分布式追踪 UI**。**Tempo** 是 Grafana 家的 traces 后端(与 Prometheus=metrics、Loki=logs 同一套),按 `trace_id` 索引、span 主体走对象存储,存 trace 便宜。
+
+**实现(零新依赖)**:Tempo 原生支持 **Zipkin receiver**,而 Zipkin v2 就是一段 JSON——`trace-aggregator` 直接手搓 Zipkin span JSON `POST` 到 `tempo:9411/api/v2/spans`,**不引入 OTel SDK**。映射:一条 dtrace = 一个 `trace_id`;dtrace 本身 = **root span**(`service.name=network`,duration=总跨度);每个 hop = **child span**(`service.name`=该事件的节点,name=`bus/kind`,timestamp=绝对时间,tags 带 key/detail)。`trace_id`/span-id 用内容 `sha256` 确定性生成 + `pushed` 去重,每条 dtrace 只推一次。env `TEMPO_ZIPKIN` 开关。
+
+**部署**:`grafana/tempo` 单二进制容器(campus-mgmt,local 存储,`lab/tempo.yaml`);Grafana 加 Tempo datasource(provisioning);`trace-aggregator` 双挂 campus-mgmt 以够到 Tempo。全部并入 `setup-telemetry.sh`(幂等)。
+
+**实测**:一次 `pe1-p1` flap → aggregator 把 45-span 的跨设备 dtrace 推给 Tempo → `GET /api/traces/<id>` 查到,`service.name` 覆盖 **network + pe1/p1/pe2/ce1-4(7 节点)**,span 按绝对时间排序正是 pe1→p1→各节点涟漪。Grafana **Explore → Tempo** 即渲染成跨设备瀑布火焰图。
+
+**坑**:Tempo 的 `distributor.receivers` 里**空的 `zipkin:` / `otlp:` 不会启用 receiver**(9411 拒连),必须显式写 `endpoint: "0.0.0.0:9411"`;OTLP 同理要显式 protocols endpoint。
+
+**边界**:`trace_id` 仍是 §15.7 的时间聚类重建、非传播——Tempo 只换了存储 + UI,不改变这一事实;Zipkin span 的 duration 用"到下一 hop 的间隔"(点状事件的近似)。
+
+**三支柱在 Grafana 闭环**:**metrics**(`pathtrace-exporter`→Prometheus,看板 Trace 行)+ **logs**(daemon syslog→Loki)+ **traces**(convergence→Tempo)。看板上 `pathtrace reachable→0` 告警 → 跳同一时刻的 Tempo 收敛瀑布 → 再跳对应节点 syslog,metrics→trace→logs 串起排障。**查看**:Grafana `http://localhost:3000` → Explore → 选 Tempo → Search(TraceQL `{}`,或 `{ name =~ "convergence.*" }`)或直接输 `trace_id`。
