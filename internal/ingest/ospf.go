@@ -19,6 +19,7 @@ import (
 
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 
+	"frr-visible/internal/correlate"
 	"frr-visible/internal/state"
 )
 
@@ -28,11 +29,16 @@ type OSPF struct {
 	sock     string
 	fallback time.Duration
 	seen     map[string]string // router-id -> interface (for deletes)
+	st       map[string]string // router-id -> adjacency-state (for change detection)
+	cor      *correlate.Correlator
 }
 
 func NewOSPF(c *state.Cache, fallback time.Duration) *OSPF {
-	return &OSPF{c: c, vtysh: "vtysh", sock: "/dev/log", fallback: fallback, seen: map[string]string{}}
+	return &OSPF{c: c, vtysh: "vtysh", sock: "/dev/log", fallback: fallback, seen: map[string]string{}, st: map[string]string{}}
 }
+
+// SetCorrelator wires the convergence-trace correlator (optional).
+func (o *OSPF) SetCorrelator(cor *correlate.Correlator) { o.cor = cor }
 
 func (o *OSPF) Run() error {
 	o.reconcile() // startup snapshot
@@ -105,20 +111,38 @@ func (o *OSPF) reconcile() {
 	seen := map[string]string{}
 	for rid, n := range cur {
 		seen[rid] = n.iface
+		st := adjState(n.state)
 		ups := []*gnmipb.Update{
-			leafUpdate(ospfNbrElems(n.iface, rid, "adjacency-state"), adjState(n.state)),
+			leafUpdate(ospfNbrElems(n.iface, rid, "adjacency-state"), st),
 			leafUpdate(ospfNbrElems(n.iface, rid, "neighbor-address"), n.addr),
 		}
 		_ = o.c.Update("openconfig", ups, nil)
-		log.Printf("[ospf] nbr %s if=%s state=%s", rid, n.iface, adjState(n.state))
+		log.Printf("[ospf] nbr %s if=%s state=%s", rid, n.iface, st)
+		if old, ok := o.st[rid]; ok && old != st { // transition only (skip first-seen)
+			o.cor.Emit("ospf", "adj-"+lc(st), rid, "if="+n.iface+" "+old+"->"+st, true)
+		}
+		o.st[rid] = st
 	}
 	for rid, iface := range o.seen {
 		if _, ok := seen[rid]; !ok {
 			_ = o.c.Update("openconfig", nil, []*gnmipb.Path{{Elem: ospfNbrElems(iface, rid, "")}})
 			log.Printf("[ospf] nbr DEL %s", rid)
+			o.cor.Emit("ospf", "adj-down", rid, "if="+iface+" neighbor gone", true)
+			delete(o.st, rid)
 		}
 	}
 	o.seen = seen
+}
+
+// lc lowercases an ASCII adjacency-state enum for a compact span kind.
+func lc(s string) string {
+	b := []byte(s)
+	for i := range b {
+		if b[i] >= 'A' && b[i] <= 'Z' {
+			b[i] += 'a' - 'A'
+		}
+	}
+	return string(b)
 }
 
 type ospfNbr struct {
@@ -181,8 +205,9 @@ func adjState(s string) string {
 }
 
 // openconfig: /network-instances/network-instance[name=default]/protocols/
-//   protocol[OSPF]/ospfv2/areas/area[0.0.0.0]/interfaces/interface[id]/neighbors/
-//   neighbor[router-id]/state/<leaf>   (area defaulted to 0.0.0.0; single-area lab)
+//
+//	protocol[OSPF]/ospfv2/areas/area[0.0.0.0]/interfaces/interface[id]/neighbors/
+//	neighbor[router-id]/state/<leaf>   (area defaulted to 0.0.0.0; single-area lab)
 func ospfNbrElems(iface, rid, leaf string) []*gnmipb.PathElem {
 	e := []*gnmipb.PathElem{
 		{Name: "network-instances"},

@@ -7,8 +7,10 @@ import (
 	"flag"
 	"log"
 	"net"
+	"net/http"
 	"time"
 
+	"frr-visible/internal/correlate"
 	"frr-visible/internal/gnmiserver"
 	"frr-visible/internal/ingest"
 	"frr-visible/internal/state"
@@ -20,9 +22,24 @@ func main() {
 	bmpAddr := flag.String("bmp", ":5000", "BMP listen address (bgpd dials in here)")
 	target := flag.String("target", "frr", "gNMI cache target name")
 	ospfReconcile := flag.Duration("ospf-reconcile", 0, "OSPF safety-net reconcile interval (0=off, pure event-driven)")
+	traceHTTP := flag.String("trace-http", ":9340", "convergence-trace HTTP endpoint (/traces); empty to disable")
 	flag.Parse()
 
 	c := state.New(*target)
+
+	// Convergence-trace correlator: folds cross-bus events into causal traces.
+	cor := correlate.New(*target)
+	go cor.Run()
+	if *traceHTTP != "" {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/traces", cor.ServeHTTP)
+		go func() {
+			log.Printf("[trace] convergence-trace HTTP on %s (/traces)", *traceHTTP)
+			if err := http.ListenAndServe(*traceHTTP, mux); err != nil {
+				log.Printf("trace-http: %v", err)
+			}
+		}()
+	}
 
 	// gNMI Subscribe server over the cache.
 	grpcSrv, err := gnmiserver.New(c)
@@ -42,6 +59,7 @@ func main() {
 
 	// BMP ingester (BGP/L3VPN control plane).
 	bmp := ingest.NewBMP(*bmpAddr, c)
+	bmp.SetCorrelator(cor)
 	go func() {
 		if err := bmp.Run(); err != nil {
 			log.Fatalf("bmp: %v", err)
@@ -50,6 +68,7 @@ func main() {
 
 	// Netlink ingester (interfaces/VLAN/FDB from the kernel).
 	nl := ingest.NewNetlink(c, 10*time.Second)
+	nl.SetCorrelator(cor)
 	go func() {
 		if err := nl.Run(); err != nil {
 			log.Printf("netlink: %v", err)
@@ -74,6 +93,7 @@ func main() {
 
 	// OSPF ingester (neighbor adjacency via syslog trigger + vtysh reconcile).
 	ospf := ingest.NewOSPF(c, *ospfReconcile)
+	ospf.SetCorrelator(cor)
 	go func() {
 		if err := ospf.Run(); err != nil {
 			log.Printf("ospf: %v", err)
@@ -82,6 +102,7 @@ func main() {
 
 	// FPM ingester (route/FIB, blocks).
 	fpm := ingest.NewFPM(*fpmAddr, c)
+	fpm.SetCorrelator(cor)
 	if err := fpm.Run(); err != nil {
 		log.Fatalf("fpm: %v", err)
 	}

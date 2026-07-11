@@ -3,6 +3,7 @@
 //   - Peer Up / Peer Down -> neighbor session-state (openconfig origin)
 //   - Route Monitoring (MP_REACH/UNREACH VPN-IPv4) -> L3VPN routes with
 //     RD / label / route-target / next-hop / peer (frr origin, control-plane view)
+//
 // This is the control-plane counterpart to fpm.go's forwarding-plane view.
 package ingest
 
@@ -17,15 +18,20 @@ import (
 
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 
+	"frr-visible/internal/correlate"
 	"frr-visible/internal/state"
 )
 
 type BMP struct {
 	addr string
 	c    *state.Cache
+	cor  *correlate.Correlator
 }
 
 func NewBMP(addr string, c *state.Cache) *BMP { return &BMP{addr: addr, c: c} }
+
+// SetCorrelator wires the convergence-trace correlator (optional).
+func (b *BMP) SetCorrelator(cor *correlate.Correlator) { b.cor = cor }
 
 const (
 	bmpVersion    = 3
@@ -39,13 +45,13 @@ const (
 	bmpInit     = 4
 	bmpTerm     = 5
 
-	bgpUpdate    = 2
-	bgpHdrLen    = 19
-	attrMPReach  = 14
+	bgpUpdate     = 2
+	bgpHdrLen     = 19
+	attrMPReach   = 14
 	attrMPUnreach = 15
-	attrExtComm  = 16
+	attrExtComm   = 16
 
-	afiIPv4  = 1
+	afiIPv4     = 1
 	safiMPLSVPN = 128
 )
 
@@ -272,8 +278,10 @@ func (b *BMP) writeVPNRoute(peer net.IP, rd, prefix string, label uint32, nh net
 	if withdraw {
 		_ = b.c.Update("frr", nil, []*gnmipb.Path{{Elem: vpnRouteElems(rd, prefix, "")}})
 		log.Printf("[bmp] WITHDRAW vpn rd=%s %s peer=%s", rd, prefix, peer)
+		b.cor.Emit("bmp", "vpn-withdraw", prefix, "rd="+rd+" peer="+peer.String(), false)
 		return
 	}
+	b.cor.Emit("bmp", "vpn-announce", prefix, "rd="+rd+" peer="+peer.String(), false)
 	nhStr := "-"
 	if nh != nil {
 		nhStr = nh.String()
@@ -296,7 +304,8 @@ func leafUpdate(elems []*gnmipb.PathElem, val string) *gnmipb.Update {
 }
 
 // openconfig: /network-instances/network-instance[name=default]/protocols/
-//   protocol[identifier=BGP][name=bgp]/bgp/neighbors/neighbor[neighbor-address=peer]/state/<leaf>
+//
+//	protocol[identifier=BGP][name=bgp]/bgp/neighbors/neighbor[neighbor-address=peer]/state/<leaf>
 func neighborElems(peer, leaf string) []*gnmipb.PathElem {
 	return []*gnmipb.PathElem{
 		{Name: "network-instances"},

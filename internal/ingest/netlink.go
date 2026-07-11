@@ -3,6 +3,7 @@
 //   - link add/del/up/down  -> /interfaces/interface[name]/state/{admin,oper}-status  (ON_CHANGE)
 //   - bridge FDB add/del     -> /network-instances/.../fdb/mac-table/entries/entry    (ON_CHANGE)
 //   - interface counters     -> /interfaces/interface[name]/state/counters/*          (SAMPLE poll)
+//
 // Requires sharing FRR's netns (sidecar), same as vrf.go.
 package ingest
 
@@ -18,17 +19,22 @@ import (
 
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 
+	"frr-visible/internal/correlate"
 	"frr-visible/internal/state"
 )
 
 type Netlink struct {
 	c    *state.Cache
 	poll time.Duration
+	cor  *correlate.Correlator
 }
 
 func NewNetlink(c *state.Cache, poll time.Duration) *Netlink {
 	return &Netlink{c: c, poll: poll}
 }
+
+// SetCorrelator wires the convergence-trace correlator (optional).
+func (n *Netlink) SetCorrelator(cor *correlate.Correlator) { n.cor = cor }
 
 func (n *Netlink) Run() error {
 	done := make(chan struct{})
@@ -59,9 +65,16 @@ func (n *Netlink) linkLoop(ch <-chan netlink.LinkUpdate) {
 		if u.Header.Type == unix.RTM_DELLINK {
 			_ = n.c.Update("openconfig", nil, []*gnmipb.Path{{Elem: ifaceElems(name, "")}})
 			log.Printf("[netlink] link DEL %s", name)
+			n.cor.Emit("netlink", "link-down", name, "link removed", true)
 			continue
 		}
 		n.writeLinkState(u.Link)
+		oper := operStatus(u.Link.Attrs().OperState)
+		kind := "link-down"
+		if oper == "UP" {
+			kind = "link-up"
+		}
+		n.cor.Emit("netlink", kind, name, "oper="+oper, true)
 	}
 }
 

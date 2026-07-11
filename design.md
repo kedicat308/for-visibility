@@ -654,4 +654,40 @@ path:  ce1 -> pe1 -> p1 -> p2 -> pe2 -> ce4
 
 **实测**:3 条流(ce1→ce4 / ce4→ce1 / ce2→ce3)均 reachable=1、hops=7,`hop_info` 逐跳与 §15.4 一致;Prometheus `sum(frr_pathtrace_reachable)=3`。看板 `FRR-visible`(Mac 上 http://localhost:3000/d/frr-visible)。这样一条路径断在哪一跳/哪个 VRF、标签栈怎么变,看板上直接可见,还能告警(reachable→0)。
 
-> 下一步(紧随):**convergence trace**——控制面收敛事件的跨进程+跨设备因果时间线(link flap → netlink/ospf-syslog/BMP/FPM 四总线按 prefix 关联成 span),补齐 trace 支柱的另一半。见对话记录的设计。
+> 下一步(紧随):**convergence trace**——控制面收敛事件的跨进程因果时间线,补齐 trace 支柱的另一半。**已落地,见 §15.6。**
+
+### 15.6 convergence trace:控制面收敛的跨进程因果时间线(2026-07-11,已实测)
+
+路由器版"三支柱"的 trace 支柱有两半:§15.1–15.5 是**数据面 path trace**(包沿设备逐跳);这一节是**控制面 convergence trace**——一次拓扑事件(链路/邻接变化)在**一台设备内多个进程**间引发的因果时间线,用 span 表示。对标微服务分布式追踪:"服务"=zebra/ospfd/bgpd 等进程,"请求"=一次收敛,"span"=每个进程/阶段的处理。
+
+**为什么 shim 能做**:它已经把该设备所有内部总线接上、都带时间戳(netlink / OSPF syslog / FPM / BMP)。做 trace 只差把这些事件按因果串起来。
+
+**实现(`internal/correlate`)**:各 ingester 在产生事件时,除写 cache 外再 `cor.Emit(bus, kind, key, detail, root)`。correlator 单 goroutine 串行折叠:
+- **root 事件**(link-down/up、adj-down/up = 拓扑触发)开一条 trace 窗口;**follow 事件**(route add/del、vpn withdraw/announce)只在窗口内追加成 span。**无 root 的 follow 直接丢弃——这天然过滤了启动时的全量 sync**(全是 follow)。
+- 时间窗聚类:相邻事件间隔 > window(3s)或静默 > idle(3s)则 flush 整条 trace。
+- `Emit` **nil-safe + 非阻塞**(缓冲满即丢并记一行),绝不拖累 ingester(牢记 §12.5 的 /dev/log 死锁教训:监控不能拖垮被监控者)。
+- 输出:`[trace] {json}` 日志 + HTTP `:9340/traces`(最近 50 条 JSON)。`lab/traceview.sh <mgmt-ip> [all|last|<id>]` 渲染成瀑布图。
+
+**实测(pe1-p1 flap)**:
+
+```
+== convergence trace @ pe1  #1 ==   root: netlink/link-down pe1-p1   span=308ms
+   +    0ms  netlink/link-down   pe1-p1        oper=DOWN
+   +    8ms  fpm/route-del       10.0.12.0/30  vrf=default     ← zebra 立即撤传输路由
+   +    8ms  fpm/route-del       10.255.0.11/32 (loopback…)
+   +   69ms  fpm/route-del       10.255.1.4/32 vrf=cust        ← VPN 前缀(ce4)撤销
+   +   69ms  fpm/route-del       10.255.1.3/32 vrf=cust
+   +  308ms  ospf/adj-down       10.255.0.11   if=pe1-p1       ← OSPF 邻居 down(最慢)
+== convergence trace @ pe1  #3 ==   root: ospf/adj-full 10.255.0.11   (link-up 后)
+   +    0ms  ospf/adj-full       10.255.0.11   INIT->FULL      ← 恢复后约 10s 才 FULL
+```
+
+**关键洞察**:同一事件里 **zebra 的 nexthop-tracking(8ms)比 OSPF 邻居检测(308ms)快两个数量级**;恢复时收敛"卡在"OSPF 重新建邻(~10s)。这正是收敛分析要回答的"用了多久、卡在哪个进程/阶段"。
+
+**诚实边界**:
+- **单设备**。一次 flap 的完整因果链跨设备(pe1 断 → p1 → … → pe2 收到 withdraw),本原型只做单节点;跨设备聚合(按 prefix + 时间 join 各节点 trace)是下一步。
+- **因果是时间窗重建、非传播的 trace-id**(路由协议无 traceparent 传播),突发叠加时关联会有歧义——§15.4 已述。
+- BMP withdraw 未进窗口:iBGP 到对端走 loopback,邻居 down 要等 hold timer(>3s 窗口),符合预期。
+- veth 恢复时 operState 会抖动(DOWN→UP),root 标签偶尔不精确,如实保留。
+
+**上看板/正式化(紧随)**:convergence trace 是事件流,天然适合 **Loki**(把 `[trace]` JSON 喂 Loki)或 **Tempo**(correlator 输出 OTLP span,Grafana 瀑布图);再加**跨设备聚合**成端到端收敛时间线。原型阶段先 `traceview.sh` 命令行 + HTTP 端点。

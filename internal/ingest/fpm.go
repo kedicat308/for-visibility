@@ -16,6 +16,7 @@ import (
 
 	gnmipb "github.com/openconfig/gnmi/proto/gnmi"
 
+	"frr-visible/internal/correlate"
 	"frr-visible/internal/state"
 )
 
@@ -24,10 +25,14 @@ type FPM struct {
 	addr string
 	c    *state.Cache
 	vrf  *VRFResolver
+	cor  *correlate.Correlator
 
 	mu sync.RWMutex
 	nh map[uint32]nexthop // nexthop-object id -> resolved nexthop
 }
+
+// SetCorrelator wires the convergence-trace correlator (optional).
+func (f *FPM) SetCorrelator(cor *correlate.Correlator) { f.cor = cor }
 
 type nexthop struct {
 	gw        net.IP
@@ -299,6 +304,11 @@ func (f *FPM) handleRoute(b []byte, del bool) {
 		op = "DEL"
 	}
 	log.Printf("[fpm] %s vrf=%s %s nh=%s oif=%d push=%s", op, vrf, prefix, nhStr, oif, labelsCSV(pushLabels))
+	kind := "route-add"
+	if del {
+		kind = "route-del"
+	}
+	f.cor.Emit("fpm", kind, prefix, "vrf="+vrf+" nh="+nhStr, false)
 
 	nhPath := aftPath(vrf, afName, prefix, "next-hop")
 	lblPath := aftPath(vrf, afName, prefix, "pushed-mpls-label-stack")
