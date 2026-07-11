@@ -120,7 +120,9 @@ func perPeer(body []byte) (peer net.IP, peerAS uint32, ok bool) {
 
 func (b *BMP) peerState(body []byte, up bool) {
 	peer, peerAS, ok := perPeer(body)
-	if !ok {
+	if !ok || peer.IsUnspecified() {
+		// Skip the Loc-RIB / unspecified peer (RFC 9069): it has no real neighbor
+		// address and would otherwise surface as a bogus 0.0.0.0 BGP neighbor.
 		return
 	}
 	st := "ESTABLISHED"
