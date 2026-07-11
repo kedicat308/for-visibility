@@ -115,7 +115,7 @@
       "datasource": { "type": "prometheus", "uid": "prometheus" },
       "gridPos": { "h": 8, "w": 8, "x": 8, "y": 32 },
       "targets": [ { "refId": "A", "expr": "openconfig_network_instances_network_instance_protocols_protocol_bgp_neighbors_neighbor_state_session_state{source=~\"$node\"}", "instant": true, "format": "table" } ],
-      "transformations": [ { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true, "target": true, "subscription_name": true, "network_instance_name": true, "protocol_identifier": true, "protocol_name": true }, "renameByName": { "source": "node", "neighbor_neighbor_address": "neighbor", "Value": "state" } } } ],
+      "transformations": [ { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true, "target": true, "subscription_name": true, "protocol_identifier": true, "protocol_name": true }, "renameByName": { "source": "node", "network_instance_name": "vrf", "neighbor_neighbor_address": "neighbor", "Value": "state" } } }, { "id": "sortBy", "options": { "fields": {}, "sort": [ { "field": "node" }, { "field": "vrf" } ] } } ],
       "fieldConfig": { "defaults": { "mappings": [ { "type": "value", "options": { "6": { "text": "ESTABLISHED", "color": "green" }, "1": { "text": "IDLE", "color": "red" }, "3": { "text": "ACTIVE", "color": "orange" } } } ] }, "overrides": [ { "matcher": { "id": "byName", "options": "state" }, "properties": [ { "id": "custom.cellOptions", "value": { "type": "color-background" } } ] } ] }
     },
     {
