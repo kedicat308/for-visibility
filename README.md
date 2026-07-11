@@ -62,6 +62,7 @@ ospfd ─ syslog ─────────────────┘
   - `gnmic-frr.yaml` — gnmic collector (shim gNMI → Prometheus :9806); `frr-visible-dashboard.json` — Grafana dashboard; `setup-telemetry.sh` — wiring (incl. pathtrace-exporter)
   - `cmd/pathtrace-exporter` — Go exporter that runs the gNMI path trace for configured flows and serves it as Prometheus metrics (`frr_pathtrace_*`), shown on the dashboard's **Trace** row — see `design.md` §15.5
   - `traceview.sh` — renders the shim's **convergence trace** (control-plane causal timeline of a link/adjacency event across netlink/OSPF/FPM/BMP, served at `:9340/traces`) as a waterfall — see `design.md` §15.6
+  - `cmd/trace-aggregator` + `dtraceview.sh` — stitch every node's convergence trace into one **cross-device distributed trace** (a topology event's ripple across the whole network, correlated by time + normalized link endpoints), served at `:9341/dtraces` — see `design.md` §15.7
   - `pathtrace.sh` — control-plane path trace via `vtysh` (walks FIB/LFIB hop-by-hop with the label stack; sees the MPLS core that IP traceroute can't — see `design.md` §15)
   - `pathtrace-gnmi.sh` — the same trace sourced **entirely from the shim's gNMI** (no device login; reads AFT push-labels + `frr:/mpls/lfib` + interface addresses) — like tracing across cEOS; see `design.md` §15.4
 

@@ -685,9 +685,39 @@ path:  ce1 -> pe1 -> p1 -> p2 -> pe2 -> ce4
 **关键洞察**:同一事件里 **zebra 的 nexthop-tracking(8ms)比 OSPF 邻居检测(308ms)快两个数量级**;恢复时收敛"卡在"OSPF 重新建邻(~10s)。这正是收敛分析要回答的"用了多久、卡在哪个进程/阶段"。
 
 **诚实边界**:
-- **单设备**。一次 flap 的完整因果链跨设备(pe1 断 → p1 → … → pe2 收到 withdraw),本原型只做单节点;跨设备聚合(按 prefix + 时间 join 各节点 trace)是下一步。
+- ~~**单设备**~~。已扩展为跨设备聚合,见 §15.7。
 - **因果是时间窗重建、非传播的 trace-id**(路由协议无 traceparent 传播),突发叠加时关联会有歧义——§15.4 已述。
 - BMP withdraw 未进窗口:iBGP 到对端走 loopback,邻居 down 要等 hold timer(>3s 窗口),符合预期。
 - veth 恢复时 operState 会抖动(DOWN→UP),root 标签偶尔不精确,如实保留。
 
-**上看板/正式化(紧随)**:convergence trace 是事件流,天然适合 **Loki**(把 `[trace]` JSON 喂 Loki)或 **Tempo**(correlator 输出 OTLP span,Grafana 瀑布图);再加**跨设备聚合**成端到端收敛时间线。原型阶段先 `traceview.sh` 命令行 + HTTP 端点。
+**上看板/正式化(紧随)**:convergence trace 是事件流,天然适合 **Loki**(把 `[trace]` JSON 喂 Loki)或 **Tempo**(correlator 输出 OTLP span,Grafana 瀑布图)。原型阶段先 `traceview.sh` 命令行 + HTTP 端点。
+
+### 15.7 跨设备聚合:端到端分布式收敛 trace(2026-07-11,已实测)
+
+§15.6 是单设备。这一节把各节点的 per-device trace **拼成一条跨设备的分布式 trace**——一次拓扑事件在它波及的每台路由器上的时间线,合并成一条。
+
+**放宽 correlator(前提)**:远端设备(离断链点远)接口没断、邻居没掉,只有**纯 follow 事件**(FIB 因远端拓扑变化而更新),会被 §15.6 的"无 root 丢弃"过滤掉——但端到端 trace 恰恰要看到远端何时收敛。于是放宽:**warmup(15s,过滤启动全量 sync)之后,一簇 follow 事件**(远端 FIB churn)**自成一条 churn trace**;零星单条(flush 时 span<3)丢弃,避免噪音。
+
+**聚合器(`cmd/trace-aggregator`,Go)**:周期拉所有节点 `:9340/traces`,按 **start 时间聚类**(window 默认 1.5s)成分布式 trace,把各节点的 span 合并、按绝对时间排序、标注来源节点;并把**链路端点规范化**(`pe1-p1` 与 `p1-pe1` → `p1--pe1`)作为关联佐证。暴露 `:9341/dtraces`;`lab/dtraceview.sh <agg-ip>` 渲染跨设备瀑布。部署同 pathtrace-exporter(frr-mgmt 172.31.0.32,`setup-telemetry` 可并入)。
+
+**关联信号(实测极强)**:一次 `pe1-p1` 断链,两端 `link-down`(pe1-p1 / p1-pe1)start 时间**对齐到 <1ms**,端点规范化互指——时间 + 链路两个独立信号都指向同一事件。
+
+**实测(一次 pe1-p1 断链的端到端 dtrace)**:
+
+```
+== distributed convergence trace #1 ==   link=p1--pe1  span=308ms  nodes=[ce1,ce2,ce3,ce4,p1,pe1,pe2]
+   +   0ms  pe1  netlink/link-down  pe1-p1          ← 断链点
+   +   1ms  p1   netlink/link-down  p1-pe1          ← 另一端(亚毫秒对齐)
+   + 12ms  p1/pe2 fpm/route-del     10.255.0.1/32…  ← zebra 撤传输路由
+   + 73ms  pe1/pe2 fpm/route-del    10.255.1.x/32   ← VPN 前缀(CE loopback)
+   +124ms  ce1..ce4 fpm/route-del   10.255.1.x/32   ← eBGP 撤销传到 CE 边缘
+   +308ms  pe1/p1 ospf/adj-down     (双向)          ← OSPF 邻居检测(最慢)
+```
+
+**洞察**:一次断链在 **~308ms 内涟漪扩散到 7 个节点**,传播波清晰:zebra FIB(12ms)→ 跨设备 BGP 逐层外扩到 CE(73→125ms)→ OSPF 邻居检测(308ms)。这是**整网端到端收敛的因果时间线**,回答"事件多快传到边缘、卡在哪一层"。
+
+**诚实边界**:
+- **因果靠时间聚类重建**(window 1.5s),非传播的 trace-id;窗口大小是"聚全 vs 误并不同事件"的权衡。
+- **依赖跨设备时钟同步**:本 lab 所有容器同宿主机同内核时钟,故 start 对齐到亚毫秒;**真实多设备网络需 NTP/PTP**,聚类窗口要相应放大。这是把此法用于生产的关键前提。
+- churn 阈值(span≥3)会滤掉变化极少的过路节点(实测 p2 只变 2 条→未计入),是"抓收敛 vs 抑噪音"的取舍。
+- **正式化下一步**:correlator 出 **OTLP span** → **Tempo**,则 Grafana 直接渲染这张跨设备瀑布(真正的分布式追踪 UI),并可与 metrics(pathtrace-exporter)、logs(syslog/Loki)在同一看板联动——路由器版三支柱闭环。

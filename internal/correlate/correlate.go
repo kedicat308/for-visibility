@@ -55,6 +55,9 @@ type Correlator struct {
 	window time.Duration // max gap for an event to join the active trace
 	idle   time.Duration // flush the active trace after this much quiet
 
+	warmup  time.Duration // ignore follow-only bursts (startup full-sync) for this long
+	started time.Time
+
 	mu   sync.Mutex
 	ring []Trace // most-recent-last, capped
 	max  int
@@ -67,6 +70,7 @@ func New(node string) *Correlator {
 		ch:     make(chan Event, 1024),
 		window: 3 * time.Second,
 		idle:   3 * time.Second,
+		warmup: 15 * time.Second,
 		max:    50,
 	}
 }
@@ -87,11 +91,13 @@ func (c *Correlator) Emit(bus, kind, key, detail string, root bool) {
 type acc struct {
 	start, last time.Time
 	root        string
+	churn       bool // opened by follow events only (a remote node's FIB convergence)
 	events      []Event
 }
 
 // Run consumes events and flushes traces. Blocking; call in its own goroutine.
 func (c *Correlator) Run() {
+	c.started = time.Now()
 	var active *acc
 	tick := time.NewTicker(250 * time.Millisecond)
 	defer tick.Stop()
@@ -104,9 +110,18 @@ func (c *Correlator) Run() {
 			}
 			if active == nil {
 				if !e.Root {
-					continue // a follow-up with no active root: ignore (filters full-sync)
+					// Follow-up with no active root. During warmup this is the startup
+					// full-sync — ignore it. After warmup, a burst of follow events is a
+					// remote node's convergence churn (its FIB reacting to a far-away
+					// topology change with no local root); open a churn trace. Lone churn
+					// traces (< 3 spans) are dropped on flush.
+					if time.Since(c.started) < c.warmup {
+						continue
+					}
+					active = &acc{start: e.TS, last: e.TS, root: "churn/" + e.Bus + "-" + e.Kind + " " + e.Key, churn: true}
+				} else {
+					active = &acc{start: e.TS, last: e.TS, root: e.Bus + "/" + e.Kind + " " + e.Key}
 				}
-				active = &acc{start: e.TS, last: e.TS, root: e.Bus + "/" + e.Kind + " " + e.Key}
 			}
 			active.last = e.TS
 			active.events = append(active.events, e)
@@ -122,6 +137,9 @@ func (c *Correlator) Run() {
 func (c *Correlator) flush(a *acc) {
 	if a == nil || len(a.events) == 0 {
 		return
+	}
+	if a.churn && len(a.events) < 3 {
+		return // a lone route change isn't a convergence event
 	}
 	c.seq++
 	spans := make([]Span, len(a.events))
