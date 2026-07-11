@@ -105,7 +105,7 @@ func operStatus(s netlink.LinkOperState) string {
 
 func (n *Netlink) neighLoop(ch <-chan netlink.NeighUpdate) {
 	for u := range ch {
-		if u.Neigh.Family != unix.AF_BRIDGE || len(u.Neigh.HardwareAddr) == 0 {
+		if u.Neigh.Family != unix.AF_BRIDGE || !isUnicastMAC(u.Neigh.HardwareAddr) {
 			continue
 		}
 		mac := u.Neigh.HardwareAddr.String()
@@ -172,6 +172,41 @@ func (n *Netlink) snapshot() {
 		n.writeLinkState(l)
 	}
 	n.sampleCounters()
+	n.snapshotFDB()
+}
+
+// snapshotFDB dumps the existing bridge FDB so entries present before the shim
+// started are visible; NeighSubscribe only delivers subsequent ON_CHANGE events.
+func (n *Netlink) snapshotFDB() {
+	neighs, err := netlink.NeighList(0, unix.AF_BRIDGE)
+	if err != nil {
+		return
+	}
+	cnt := 0
+	for _, ne := range neighs {
+		if !isUnicastMAC(ne.HardwareAddr) {
+			continue
+		}
+		mac := ne.HardwareAddr.String()
+		vlan := strconv.Itoa(ne.Vlan)
+		ifName := ""
+		if lk, err := netlink.LinkByIndex(ne.LinkIndex); err == nil {
+			ifName = lk.Attrs().Name
+		}
+		ups := []*gnmipb.Update{
+			leafUpdate(fdbElems(mac, vlan, "mac-address"), mac),
+			leafUpdate(fdbElems(mac, vlan, "interface"), ifName),
+		}
+		_ = n.c.Update("openconfig", ups, nil)
+		cnt++
+	}
+	log.Printf("[netlink] fdb snapshot: %d unicast entries", cnt)
+}
+
+// isUnicastMAC reports whether addr is a non-empty unicast MAC (even first
+// octet) — filters out multicast/broadcast bridge noise (33:33:*, 01:00:5e:*).
+func isUnicastMAC(addr net.HardwareAddr) bool {
+	return len(addr) == 6 && addr[0]&1 == 0
 }
 
 // ---- path helpers ----

@@ -118,11 +118,15 @@ func parseLLDP(data []byte) map[string]*lldpNbr {
 		for name, v := range ifaces {
 			res[name] = parseIface(name, asMap(v))
 		}
-	} else if arr, ok := lldp["interface"].([]any); ok { // array of {name:..}
+	} else if arr, ok := lldp["interface"].([]any); ok { // array form
 		for _, e := range arr {
 			m := asMap(e)
-			if name := asStr(m["name"]); name != "" {
+			if name := asStr(m["name"]); name != "" { // [{name:.., ...}]
 				res[name] = parseIface(name, m)
+			} else { // [{"<ifname>": {...}}] — lldpd 1.0.x default
+				for name, v := range m {
+					res[name] = parseIface(name, asMap(v))
+				}
 			}
 		}
 	}

@@ -482,3 +482,61 @@ ip addr add 10.0.30.1/24 dev swp3
 - lldpd:<https://github.com/lldpd/lldpd> · mstpd:<https://github.com/mstpd/mstpd>
 - 事件总线:FRR **BMP**<https://docs.frrouting.org/en/latest/bmp.html> · FRR **FPM**(zebra `fpm`/`dplane_fpm_nl`)· netlink 组播(`RTNLGRP_*`)· lldpd watch(liblldpctl)
 - 本地约束(记忆):FIB=FPM(已验证)、读=CoPP 限流。**注:本项目对 FRR 采用事件总线 BMP(BGP)/ FPM(路由)/ syslog(OSPF)——与 cEOS 场景(BGP=gNMI、OSPF=syslog 因无 gNMI 路径)分别选型,别混用。**
+
+---
+
+## 14. 端到端实测:5 节点拓扑 + 看板(2026-07-11)
+
+把 8 类指标从"逐个验证"推进到**一个连贯拓扑上跑通、并接到 Grafana 看板**。所有步骤脚本化在 `lab/`,幂等可复现。
+
+### 14.1 拓扑
+
+```
+ce1 ─── pe1 ─── p1 ─── pe2 ─── ce2          # 每台内嵌一个 shim(gNMI :9339)
+        └────── VRF cust ──────┘
+  OSPF area0 + LDP 核心(pe1-p1-pe2)          # 传输标签
+  iBGP VPNv4 pe1↔pe2(update-source lo)       # VPN 标签 + RD/RT
+  eBGP PE-CE(ce1 AS65101 / ce2 AS65102)      # 客户路由入 VRF
+```
+
+每台双平面:数据面 p2p(`l_*` docker 网络)+ 管理面 `campus-mgmt`(172.30.30.0/24),gnmic 从管理面订 `:9339`。mgmt IP:ce1 .101 / pe1 .111 / p1 .112 / pe2 .113 / ce2 .102。
+实测:OSPF 全 FULL、LDP 全 OPERATIONAL、VRF FIB 里是真标签栈 `label 17/80`(LDP 传输 17 + BGP VPN 80)、ce1→ce2 环回源 ping 0% 丢包走 VPN。
+
+### 14.2 遥测管道
+
+```
+5×shim(gNMI :9339,3 origin)
+   → gnmic-frr 容器(172.30.30.20,prometheus output :9806)
+   → Prometheus(:9090,job=gnmic-frr)
+   → Grafana 看板 "frr-visible"(匿名 admin,http://localhost:3000/d/frr-visible)
+```
+
+- `gnmic-frr.yaml`:专用采集器,与 cEOS 的 gnmic 分开。复用 `oper-status`/`bgp-state` 的 str2num processor,新增 `ospf-state`(FULL=6..DOWN=0);字符串叶子(mac/next-hop/system-name/route-target)用 `strings-as-labels: true` 变标签、series=1,PromQL `count()` 数条数。
+- 数值化后:oper-status→1/0,bgp session-state→6(Established),ospf adjacency→6(FULL);L3VPN `label` 本身数值(=80),`route-target` series 带 RT 标签。
+- 看板 8 类面板 + `$node` 模板变量过滤:容器 CPU/内存、接口速率、端口状态时间线、OSPF/BGP/LLDP 邻居表、L3VPN 路由表(RD/prefix/label)、FIB/AFT 表、FDB MAC 表。
+
+### 14.3 本轮修的 shim 真 bug(代码)
+
+1. **`internal/ingest/netlink.go` 缺 FDB 初始快照**。`NeighSubscribe` 只推 ON_CHANGE 增量,shim 启动前已存在的 FDB 表项永远看不到。修:`snapshotFDB()` 用 `NeighList(0, AF_BRIDGE)` 拉一次全量,并加 `isUnicastMAC` 过滤掉 `33:33:*`/`01:00:5e:*` 组播噪声(同一过滤也用到实时 loop)。
+2. **`internal/ingest/lldp.go` JSON 数组形态没解析**。lldpd 1.0.x `-f json` 输出 `lldp.interface` 是**数组、每元素是单键对象** `[{"eth0":{...}}]`,而旧代码只认 `[{"name":"eth0",...}]`,导致全被跳过。修:数组分支加"单键对象即接口名"的处理。
+3. **`internal/gnmiserver/server.go` Subscribe 强制要 prefix.target**。openconfig `subscribe.Server` 对没带 target 的请求直接 `InvalidArgument: request must contain a prefix`,而通用采集器(gnmic/Telegraf)默认不发 target。修:加 `targetDefaultingStream` 包装流,客户端没给时补本机 cache target——单 target 的 gNMI 盒子本就不该要求客户端知道内部 target 名。
+
+### 14.4 踩坑纠正(环境/配置层)
+
+- **⚠️ 无键 list 不当通配(最影响使用)**。这个 openconfig cache 对**无键 list 元素按字面匹配、不当 wildcard**(gNMI 规范里缺 key = all)。后果:`.../interface/state/oper-status` 这种精确 leaf 路径 **Get/Subscribe 都返回空**,只有子树订阅(`/interfaces`)能匹配。**采集路径必须显式写 `[key=*]`**——`gnmic-frr.yaml` 里每个 list 都通配了。(可选后续:在 shim 侧把无键元素重写为通配,让它符合规范。)
+- **docker bridge 默认丢 LLDP 组播**(`01:80:c2:00:00:0e`)。要给每个承载链路的网桥设 `group_fwd_mask=0x4000`,lldpd 才能互相学到邻居。
+- **FPM/BMP 是 FRR 可加载模块,要 `-M` 载入**。`router:v1` 的 daemons 文件里 zebra 要 `-M dplane_fpm_nl`、bgpd 要 `-M bmp`,否则 `fpm address` / `bmp targets` 命令不认。
+- **eBGP 默认要策略**。FRR `bgp ebgp-requires-policy` 默认开,PE-CE 前缀被 `(Policy)` 拦;lab 里 CE 和 PE-vrf 实例都加 `no bgp ebgp-requires-policy`。
+- **LDP 集成配置有加载时序坑**。整合 `frr.conf` 里的 `mpls ldp` 块可能没被 ldpd 及时吃进去;改成**启动后用 `vtysh -c` 下发** LDP 更可靠(`build-topo.sh` 就这么做)。没有 LDP 传输标签,VPNv4 远端 PE 下一跳解析不出 LSP,VRF FIB 装不上路由。
+- **p2p docker 网络别把 `.1` 给容器**——docker 把子网 `.1` 占作网关。lab 用 `.254` 做网关腾出 `.1/.2`。
+- **VRF enslave 保留 IPv4**。这版内核 `ip link set <if> master <vrf>` 不会 flush 地址,重复 `ip addr add` 会报"已分配",要容错。
+
+### 14.5 复现(虚机 my-frr 内)
+
+```bash
+bash lab/build-topo.sh      # 建 5 节点拓扑(幂等,含 teardown)
+bash lab/check-topo.sh      # 验 OSPF/LDP/BGP/L3VPN 收敛
+bash lab/deploy-shim.sh     # 编译+嵌入部署 shim、装 lldpd、建 bridge/FDB、配 FPM/BMP/OSPF-syslog
+bash lab/setup-telemetry.sh # 起 gnmic-frr、加 prometheus job、装看板
+# 打开 http://localhost:3000/d/frr-visible
+```

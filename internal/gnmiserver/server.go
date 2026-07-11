@@ -38,6 +38,37 @@ func New(c *state.Cache) (*grpc.Server, error) {
 	return g, nil
 }
 
+// Subscribe defaults the request prefix target to our single cache target when
+// the client omits it. The embedded subscribe.Server rejects target-less
+// requests ("request must contain a prefix"), but most collectors (gnmic,
+// Telegraf) don't set a target — a single-target gNMI box shouldn't require it.
+func (s *Server) Subscribe(stream gnmipb.GNMI_SubscribeServer) error {
+	return s.Server.Subscribe(&targetDefaultingStream{stream, s.cache.Target()})
+}
+
+// targetDefaultingStream wraps the Subscribe server stream and injects our
+// cache target into every incoming SubscribeRequest that lacks one.
+type targetDefaultingStream struct {
+	gnmipb.GNMI_SubscribeServer
+	target string
+}
+
+func (w *targetDefaultingStream) Recv() (*gnmipb.SubscribeRequest, error) {
+	req, err := w.GNMI_SubscribeServer.Recv()
+	if err != nil {
+		return req, err
+	}
+	if sub := req.GetSubscribe(); sub != nil {
+		if sub.Prefix == nil {
+			sub.Prefix = &gnmipb.Path{}
+		}
+		if sub.Prefix.Target == "" {
+			sub.Prefix.Target = w.target
+		}
+	}
+	return req, nil
+}
+
 // Capabilities advertises the models and encodings we speak.
 func (s *Server) Capabilities(_ context.Context, _ *gnmipb.CapabilityRequest) (*gnmipb.CapabilityResponse, error) {
 	return &gnmipb.CapabilityResponse{

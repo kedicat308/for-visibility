@@ -55,7 +55,11 @@ ospfd ─ syslog ─────────────────┘
 - `internal/ingest/cgroup.go` — container CPU/memory (host origin, SAMPLE)
 - `internal/ingest/ospf.go` — OSPF neighbors via syslog trigger + vtysh reconcile
 - `internal/ingest/vrf.go` — VRF table-id → name (netlink)
-- `lab/` — reproducible L3VPN test lab (pe1/pe2 configs + run scripts) / 可复现测试环境
+- `lab/` — reproducible 5-node MPLS L3VPN lab **+ end-to-end Grafana dashboard** (8/8 metrics) / 5 节点可复现实验 + 端到端看板
+  - `build-topo.sh` `check-topo.sh` — 5-node topology (ce1-pe1-p1-pe2-ce2) build + convergence check
+  - `deploy-shim.sh` — compile + embed the shim into all 5, wire FPM/BMP/OSPF-syslog, install lldpd, bridge/FDB
+  - `gnmic-frr.yaml` — gnmic collector (shim gNMI → Prometheus :9806); `frr-visible-dashboard.json` — Grafana dashboard
+  - `setup-telemetry.sh` — gnmic-frr → Prometheus → Grafana wiring
 
 ## Build / Run / 构建·运行
 
@@ -81,7 +85,21 @@ gnmic -a 172.30.0.11:9339 --insecure get --path "openconfig:/interfaces/interfac
 gnmic -a 172.30.0.11:9339 --insecure get --path "frr:/bgp-rib/afi-safis/afi-safi[name=l3vpn-ipv4-unicast]/routes"
 ```
 
-Reproduce the L3VPN test lab / 复现 L3VPN 测试环境: see `lab/run2.sh` (OSPF+LDP underlay, iBGP VPNv4, cust VRF on each PE).
+### End-to-end lab + dashboard / 端到端实验与看板
+
+Inside a host with FRR containers, build the 5-node backbone, deploy the shim, and wire the dashboard — all idempotent:
+在装有 FRR 容器的宿主上,一次建好 5 节点骨干、部署 shim、接通看板(全部幂等):
+
+```bash
+bash lab/build-topo.sh      # 5-node topology ce1-pe1-p1-pe2-ce2 (OSPF+LDP core, iBGP VPNv4, VRF cust, eBGP PE-CE)
+bash lab/check-topo.sh      # verify OSPF FULL / LDP OPERATIONAL / VPNv4 / L3VPN forwarding
+bash lab/deploy-shim.sh     # build + embed shim in all 5, install lldpd, bridge/FDB, wire FPM/BMP/OSPF-syslog
+bash lab/setup-telemetry.sh # gnmic-frr -> Prometheus -> Grafana
+# open http://localhost:3000/d/frr-visible
+```
+
+All 8 metric categories carry real data on a coherent topology; the dashboard has a `$node` filter and panels for CPU/mem, interface rate + state timeline, OSPF/BGP/LLDP neighbor tables, and L3VPN / FIB / FDB tables. See `design.md` §14 for the full write-up (incl. the 3 shim bug-fixes and the environment gotchas).
+8 类指标在一个连贯拓扑上都有真实数据;看板含 `$node` 过滤和全部 8 类面板。完整记录见 `design.md` §14(含 3 个 shim bug 修复与环境踩坑)。
 
 ## Gotchas / 踩坑记录
 
@@ -89,6 +107,9 @@ Reproduce the L3VPN test lab / 复现 L3VPN 测试环境: see `lab/run2.sh` (OSP
 - **bind-mount inode trap / inode 坑** — `go build -o` makes a new inode; `-v file:/x` binds the old one, so the container runs the stale binary. Use `docker cp`. / 用 `docker cp` 更新容器内二进制。
 - **lldpcli watch block-buffering / 块缓冲** — its stdout block-buffers over a pipe; a 15s periodic reconcile is the safety net. / 加 15s 周期兜底。
 - **LLDP needs same mount ns as lldpd** (lldpcli uses a Unix socket). / LLDP 需与 lldpd 同 mount ns。
+- **⚠️ Unkeyed list elements are matched literally, not as wildcards** — this cache treats `interface` (no key) as an exact path segment, so a precise leaf path like `/interfaces/interface/state/oper-status` returns nothing on Get/Subscribe; only subtree subscriptions match. Collectors must spell out `[key=*]` (see `lab/gnmic-frr.yaml`). / 无键 list 元素按字面匹配、不当通配,采集路径必须显式写 `[key=*]`,否则精确 leaf 返回空。
+- **LLDP frames are dropped by Linux/docker bridges** unless `group_fwd_mask=0x4000` is set on each bridge. / 网桥默认丢 LLDP 组播,要设 `group_fwd_mask=0x4000`。
+- **FPM/BMP are FRR loadable modules** — zebra needs `-M dplane_fpm_nl`, bgpd needs `-M bmp`, else `fpm address` / `bmp` commands aren't recognized. / FPM/BMP 是模块,要 `-M` 载入。
 
 ## Next / 下一步
 
