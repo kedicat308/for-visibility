@@ -26,7 +26,7 @@
     {
       "id": 2, "type": "stat", "title": "Nodes monitored / 受监控节点",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
       "targets": [ { "refId": "A", "expr": "count(count by(source)(host_container_memory_state_current))", "instant": true } ],
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "blue" } } },
       "options": { "colorMode": "background", "graphMode": "none", "textMode": "value" }
@@ -34,7 +34,7 @@
     {
       "id": 3, "type": "stat", "title": "BGP sessions Established / BGP 已建立",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
       "targets": [ { "refId": "A", "expr": "count(openconfig_network_instances_network_instance_protocols_protocol_bgp_neighbors_neighbor_state_session_state == 6)", "instant": true } ],
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "green" } } },
       "options": { "colorMode": "background", "graphMode": "none", "textMode": "value" }
@@ -42,7 +42,7 @@
     {
       "id": 4, "type": "stat", "title": "OSPF adjacencies FULL / OSPF 邻接",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
       "targets": [ { "refId": "A", "expr": "count(openconfig_network_instances_network_instance_protocols_protocol_ospfv2_areas_area_interfaces_interface_neighbors_neighbor_state_adjacency_state == 6)", "instant": true } ],
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "green" } } },
       "options": { "colorMode": "background", "graphMode": "none", "textMode": "value" }
@@ -50,10 +50,15 @@
     {
       "id": 5, "type": "stat", "title": "L3VPN routes / VPN 路由数",
       "datasource": { "type": "prometheus", "uid": "prometheus" },
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
       "targets": [ { "refId": "A", "expr": "count(frr_bgp_rib_afi_safis_afi_safi_routes_route_state_label)", "instant": true } ],
       "fieldConfig": { "defaults": { "color": { "mode": "fixed", "fixedColor": "purple" } } },
       "options": { "colorMode": "background", "graphMode": "none", "textMode": "value" }
+    },
+    {
+      "id": 6, "type": "text", "title": "Topology / 拓扑 (8 nodes)",
+      "gridPos": { "h": 4, "w": 8, "x": 16, "y": 1 },
+      "options": { "mode": "markdown", "content": "**Core (MPLS):**  PE1 -- P1 -- P2 -- PE2\n\n**Edge (VRF cust):**  ce1,ce2 -> PE1  |  ce3,ce4 -> PE2\n\n2x PE, 2x P, 4x CE  |  OSPF+LDP core, iBGP VPNv4, eBGP PE-CE" }
     },
 
     { "type": "row", "title": "1 · Container CPU / Memory (cgroup)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 }, "id": 10 },
@@ -174,6 +179,18 @@
       "gridPos": { "h": 11, "w": 24, "x": 0, "y": 62 },
       "targets": [ { "refId": "A", "expr": "frr_pathtrace_hop_info", "instant": true, "format": "table" } ],
       "transformations": [ { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true, "Value": true }, "indexByName": { "flow": 0, "seq": 1, "node": 2, "kind": 3, "nexthop": 4, "labels": 5, "detail": 6 }, "renameByName": { "nexthop": "next-hop" } } }, { "id": "sortBy", "options": { "fields": {}, "sort": [ { "field": "flow" }, { "field": "seq" } ] } } ]
+    },
+    {
+      "id": 54, "type": "table",
+      "title": "Convergence traces (Tempo) — click a Trace ID for the cross-device waterfall / 跨设备收敛 trace",
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 73 },
+      "targets": [ { "refId": "A", "datasource": { "type": "tempo", "uid": "tempo" }, "queryType": "traceqlSearch", "query": "{}", "limit": 20, "tableType": "traces", "filters": [] } ]
+    },
+    {
+      "id": 55, "type": "text", "title": "跨设备收敛瀑布 (Tempo) / how to view",
+      "gridPos": { "h": 3, "w": 24, "x": 0, "y": 82 },
+      "options": { "mode": "markdown", "content": "上表点 **Trace ID** 展开跨设备 span 瀑布(pe1 -> p1 -> ... -> ce 的收敛时间线);若表为空,点这里 [在 Explore 打开 Tempo](/explore) -> 选 **Tempo** 数据源 -> TraceQL 输入 `{}` -> 点任一 trace。" }
     }
   ]
 }
