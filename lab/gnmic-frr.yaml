@@ -6,11 +6,14 @@ encoding: json_ietf
 log: true
 
 targets:
-  172.30.30.101:9339: { name: ce1 }
-  172.30.30.111:9339: { name: pe1 }
-  172.30.30.112:9339: { name: p1 }
-  172.30.30.113:9339: { name: pe2 }
-  172.30.30.102:9339: { name: ce2 }
+  172.31.0.11:9339:  { name: pe1 }
+  172.31.0.12:9339:  { name: pe2 }
+  172.31.0.21:9339:  { name: p1 }
+  172.31.0.22:9339:  { name: p2 }
+  172.31.0.101:9339: { name: ce1 }
+  172.31.0.102:9339: { name: ce2 }
+  172.31.0.103:9339: { name: ce3 }
+  172.31.0.104:9339: { name: ce4 }
 
 subscriptions:
   # 1. container CPU / memory (host origin) — true gauges, SAMPLE

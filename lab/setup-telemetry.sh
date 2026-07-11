@@ -6,16 +6,14 @@ set -euo pipefail
 TELEM=/home/fanwei.guest/arista/telemetry
 LAB=/Users/fanwei/arista/frr-visible/lab
 
-# 1. gnmic-frr collector (idempotent) — subscribes to the 5 shim :9339
-if ! docker ps --format '{{.Names}}' | grep -qx gnmic-frr; then
-  docker rm -f gnmic-frr >/dev/null 2>&1 || true
-  docker run -d --name gnmic-frr --network campus-mgmt --ip 172.30.30.20 \
-    -v "$LAB/gnmic-frr.yaml:/app/gnmic.yaml:ro" --restart unless-stopped \
-    ghcr.io/openconfig/gnmic:latest --config /app/gnmic.yaml subscribe >/dev/null
-  echo "gnmic-frr started"
-else
-  echo "gnmic-frr already running"
-fi
+# 1. gnmic-frr collector — dual-homed: frr-mgmt (reach the 8 shim :9339) +
+#    campus-mgmt (so Prometheus can scrape :9806). Recreate to pick up new targets.
+docker rm -f gnmic-frr >/dev/null 2>&1 || true
+docker run -d --name gnmic-frr --network frr-mgmt --ip 172.31.0.30 \
+  -v "$LAB/gnmic-frr.yaml:/app/gnmic.yaml:ro" --restart unless-stopped \
+  ghcr.io/openconfig/gnmic:latest --config /app/gnmic.yaml subscribe >/dev/null
+docker network connect campus-mgmt gnmic-frr --ip 172.30.30.20
+echo "gnmic-frr started (frr-mgmt 172.31.0.30 + campus-mgmt 172.30.30.20)"
 
 # 2. Prometheus scrape job for gnmic-frr (idempotent)
 if ! grep -q "gnmic-frr" "$TELEM/prometheus.yml"; then

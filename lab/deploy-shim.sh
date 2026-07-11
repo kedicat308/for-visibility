@@ -1,13 +1,14 @@
 #!/usr/bin/env bash
-# deploy-shim.sh — build the frr-visible shim, deploy it EMBEDDED into all 5
+# deploy-shim.sh — build the frr-visible shim, deploy it EMBEDDED into all 8
 # FRR containers, and point each FRR's FPM/BMP/OSPF-syslog at the local shim.
 # Also installs lldpd (LLDP metric) and a bridge+FDB on ce1 (VLAN/FDB metric).
-# Run inside the my-frr VM, after build-topo.sh.
+# Run inside the my-frr VM, after build-topo.sh + config-l3vpn.sh.
 set -euo pipefail
 
-NODES="ce1 pe1 p1 pe2 ce2"
-OSPF_NODES="pe1 p1 pe2"
-declare -A ASN=( [ce1]=65101 [pe1]=65000 [pe2]=65000 [ce2]=65102 )  # p1: no bgpd
+NODES="pe1 pe2 p1 p2 ce1 ce2 ce3 ce4"
+OSPF_NODES="pe1 p1 p2 pe2"
+# p1/p2 run no bgpd; PEs are AS65000, each CE its own AS
+declare -A ASN=( [pe1]=65000 [pe2]=65000 [ce1]=65101 [ce2]=65102 [ce3]=65103 [ce4]=65104 )
 
 echo "== build shim (static) =="
 cd /Users/fanwei/arista/frr-visible
@@ -65,4 +66,5 @@ for n in $OSPF_NODES; do
 done
 
 echo "== done. shim reachable at mgmt IPs :9339 =="
-echo "   ce1 172.30.30.101 | pe1 172.30.30.111 | p1 172.30.30.112 | pe2 172.30.30.113 | ce2 172.30.30.102"
+echo "   pe1 172.31.0.11 | pe2 172.31.0.12 | p1 172.31.0.21 | p2 172.31.0.22"
+echo "   ce1 172.31.0.101 | ce2 172.31.0.102 | ce3 172.31.0.103 | ce4 172.31.0.104"

@@ -55,11 +55,12 @@ ospfd ─ syslog ─────────────────┘
 - `internal/ingest/cgroup.go` — container CPU/memory (host origin, SAMPLE)
 - `internal/ingest/ospf.go` — OSPF neighbors via syslog trigger + vtysh reconcile
 - `internal/ingest/vrf.go` — VRF table-id → name (netlink)
-- `lab/` — reproducible 5-node MPLS L3VPN lab **+ end-to-end Grafana dashboard** (8/8 metrics) / 5 节点可复现实验 + 端到端看板
-  - `build-topo.sh` `check-topo.sh` — 5-node topology (ce1-pe1-p1-pe2-ce2) build + convergence check
-  - `deploy-shim.sh` — compile + embed the shim into all 5, wire FPM/BMP/OSPF-syslog, install lldpd, bridge/FDB
-  - `gnmic-frr.yaml` — gnmic collector (shim gNMI → Prometheus :9806); `frr-visible-dashboard.json` — Grafana dashboard
-  - `setup-telemetry.sh` — gnmic-frr → Prometheus → Grafana wiring
+- `lab/` — reproducible 8-node MPLS L3VPN lab **+ end-to-end Grafana dashboard** (8/8 metrics) / 8 节点可复现实验 + 端到端看板
+  - `build-topo.sh` — 8-node topology (2×PE, 2×P, 4×CE), **veth point-to-point** data plane + dedicated `frr-mgmt` net (connectivity only)
+  - `config-l3vpn.sh` — OSPF+LDP core, iBGP VPNv4, VRF cust, PE-CE eBGP (protocols, run after build); `check-topo.sh` — convergence check
+  - `deploy-shim.sh` — compile + embed the shim into all 8, wire FPM/BMP/OSPF-syslog, install lldpd, bridge/FDB
+  - `gnmic-frr.yaml` — gnmic collector (shim gNMI → Prometheus :9806); `frr-visible-dashboard.json` — Grafana dashboard; `setup-telemetry.sh` — wiring
+  - `pathtrace.sh` — control-plane path trace (walks FIB/LFIB hop-by-hop with the label stack; sees the MPLS core that IP traceroute can't — see `design.md` §15)
 
 ## Build / Run / 构建·运行
 
@@ -87,15 +88,18 @@ gnmic -a 172.30.0.11:9339 --insecure get --path "frr:/bgp-rib/afi-safis/afi-safi
 
 ### End-to-end lab + dashboard / 端到端实验与看板
 
-Inside a host with FRR containers, build the 5-node backbone, deploy the shim, and wire the dashboard — all idempotent:
-在装有 FRR 容器的宿主上,一次建好 5 节点骨干、部署 shim、接通看板(全部幂等):
+Inside a host with FRR containers, build the 8-node backbone, deploy the shim, and wire the dashboard — all idempotent:
+在装有 FRR 容器的宿主上,一次建好 8 节点骨干、部署 shim、接通看板(全部幂等):
 
 ```bash
-bash lab/build-topo.sh      # 5-node topology ce1-pe1-p1-pe2-ce2 (OSPF+LDP core, iBGP VPNv4, VRF cust, eBGP PE-CE)
+bash lab/build-topo.sh      # 8-node topology (2xPE 2xP 4xCE), veth p2p data plane + frr-mgmt net (connectivity)
+bash lab/config-l3vpn.sh    # OSPF+LDP core, iBGP VPNv4, VRF cust, PE-CE eBGP (protocols)
 bash lab/check-topo.sh      # verify OSPF FULL / LDP OPERATIONAL / VPNv4 / L3VPN forwarding
-bash lab/deploy-shim.sh     # build + embed shim in all 5, install lldpd, bridge/FDB, wire FPM/BMP/OSPF-syslog
+bash lab/deploy-shim.sh     # build + embed shim in all 8, install lldpd, bridge/FDB, wire FPM/BMP/OSPF-syslog
 bash lab/setup-telemetry.sh # gnmic-frr -> Prometheus -> Grafana
 # open http://localhost:3000/d/frr-visible
+
+bash lab/pathtrace.sh ce1 10.255.1.4   # control-plane path trace ce1 -> ce4 (shows the MPLS core)
 ```
 
 All 8 metric categories carry real data on a coherent topology; the dashboard has a `$node` filter and panels for CPU/mem, interface rate + state timeline, OSPF/BGP/LLDP neighbor tables, and L3VPN / FIB / FDB tables. See `design.md` §14 for the full write-up (incl. the 3 shim bug-fixes and the environment gotchas).

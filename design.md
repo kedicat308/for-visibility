@@ -540,3 +540,58 @@ bash lab/deploy-shim.sh     # 编译+嵌入部署 shim、装 lldpd、建 bridge/
 bash lab/setup-telemetry.sh # 起 gnmic-frr、加 prometheus job、装看板
 # 打开 http://localhost:3000/d/frr-visible
 ```
+
+> **注(2026-07-11 后续)**:拓扑已从 5 节点扩到 **8 节点**(2×PE + 2×P + 4×CE),数据面改为 **veth 点对点直连**(接口名确定,如 `pe1-p1`/`pe1-ce1`),管理面改为**专属 `frr-mgmt`(172.31.0.0/24)**,与共享网络分离。协议配置从 `build-topo.sh` 拆出到独立的 `config-l3vpn.sh`(先做连接、再配协议)。所有 lab 脚本已相应重写。
+
+## 15. 路径追踪(path tracing):Linux MPLS 的坑与"控制面重建"方案(2026-07-11)
+
+补齐"统一诊断"里的**路径追踪**能力。先厘清:可观测性第三支柱的**分布式 trace(OpenTelemetry/span)是软件/微服务概念,不套用于路由器数据面**——一台路由器转发包不是"带 trace ID 的请求流经一串服务"。网络里的"trace"是另外的东西:**路径追踪(traceroute)** 和**流追踪(sFlow/IPFIX)**。这里解决路径追踪。
+
+### 15.1 关键发现:Linux MPLS 核心对 IP traceroute 隐身(已实测定性)
+
+在 8 节点 L3VPN 上跑 `traceroute ce1 -> ce4`,结果核心 P 节点全是 `*`:
+
+```
+1  10.0.21.1 (pe1)     ← PE-CE 是纯 IP,可见
+2  *        (p1)       ← 核心 P 节点隐身
+3  *        (p2)
+4  10.255.1.4 (ce4)
+```
+
+**根因(内核计数器级证据,非黑盒臆测)**:Linux 的 MPLS 转发面**对 TTL 过期的标签包不生成 ICMP Time Exceeded**。验证方法——观察同一台 LSR(p1)的 `IcmpOutTimeExcds` 计数器:
+
+| 触发 | `IcmpOutTimeExcds` delta |
+|---|---|
+| 纯 IP TTL 过期(经 p1)| **+2**(生成了) |
+| MPLS 标签 TTL 过期(经 p1)| **0**(根本没生成) |
+
+计数器在 `icmp_send()` **生成那一刻**就 +1,delta=0 排除了"生成了但被内部丢弃",证明是**根本没生成**——`mpls_forward()` 在 TTL 归零时直接 drop。实测内核 **Ubuntu 6.17.0-40**(2026 很新的版本)依然如此。**没有 sysctl 能开启**(是代码路径问题)。
+
+**踩坑纠错**:一开始用"p1 有到源的直连路由却不回 ICMP"来"证明"没生成——**这个推理是错的**。因为按 RFC 标准,LSR 生成的 ICMP 应该**沿 LSP 顺向压标签送到出口 LER、再由出口路由回源**(ICMP 隧道化,配合 RFC 4950 标签扩展),而不是走直连 IP 直接回源;所以 p1 有没有直连回程路由**不相关**。真正的证据是上面的内核计数器。
+
+**结论的边界**:ICMP 隧道化是**标准/商用设备(Cisco/Juniper)**的正确行为;而**主线 Linux(至今 6.17)的 MPLS 数据面没有实现它**——过期标签包静默丢弃,故 Linux MPLS 核心天生对 traceroute 隐身。
+
+### 15.2 方案:控制面路径重建(control-plane path walk)
+
+既然数据面 ICMP 探不了核心,就**顺着转发表逐跳走**:每个节点查它对当前前缀/标签的转发决定(出接口、下一跳、标签 push/swap/pop),接力到下一跳。**在 Linux 上 FIB 就是数据面(netlink 编程进内核),这是权威的**,而且比 traceroute 信息更全(每跳标签栈都有)、免疫 ICMP 缺陷。
+
+工具 **`lab/pathtrace.sh <起点> <目的IP>`**:用 vtysh JSON + jq,带一个标签栈状态机(push / swap / PHP-pop / 出口弹标签进 VRF)。`ce1 -> ce4` 输出:
+
+```
+ce1   IP/default            via ce1-pe1  -> 10.0.21.1
+pe1   IP/cust   push[18,80]  via pe1-p1   -> 10.0.12.2      # 压 传输18 + VPN80
+p1    MPLS      swap 18->16   via p1-p2    -> 10.0.13.2   stack[16 80]
+p2    MPLS      pop 16 (PHP)  via p2-pe2   -> 10.0.14.2   stack[80]   # PHP 弹传输标签
+pe2   MPLS      pop 80   -> VRF cust                                   # 弹 VPN 标签进 VRF
+pe2   IP/cust              via pe2-ce4  -> 10.0.24.2
+ce4   [dest]  destination reached
+path: ce1 -> pe1 -> p1 -> p2 -> pe2 -> ce4
+```
+
+核心 p1/p2 全现形,每跳标签操作精确。双向通用(反向 ce4→ce1 标签不同,如 pe2 压 `[19,80]`),证明是实时读每节点 LFIB。
+
+### 15.3 落进"统一诊断"的形态
+
+- **分工**:CE↔PE 纯 IP 边缘用 IP traceroute(可见);**MPLS 核心用控制面重建**。合起来是完整端到端 trace。
+- **gNOI Traceroute 的注意点**:若给 shim 实现 gNOI `System.Traceroute`(内部跑 `traceroute`),在 FRR 上核心会如实返回 `*`——这是 Linux MPLS 固有行为,不是 bug,须在文档写明。
+- **正版演进**:`pathtrace.sh` 现在是 `docker exec vtysh` 登设备读表;正版应**读 shim 的 gNMI**——AFT FIB(`openconfig:/network-instances/.../afts/.../next-hop`)与 MPLS 标签数据 shim 已在 cache 里,path-trace 即"节点接节点查 gNMI",与 cEOS 同接口,真正统一。这才是 Linux/FRR MPLS 上路径追踪的正确落地。
