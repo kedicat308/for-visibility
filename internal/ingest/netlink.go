@@ -7,6 +7,7 @@
 package ingest
 
 import (
+	"fmt"
 	"log"
 	"net"
 	"strconv"
@@ -135,6 +136,84 @@ func (n *Netlink) counterLoop() {
 	defer t.Stop()
 	for range t.C {
 		n.sampleCounters()
+		n.snapshotMPLS()
+		n.snapshotAddrs()
+	}
+}
+
+// snapshotMPLS dumps the kernel MPLS forwarding table (the LFIB) and exports each
+// entry under frr:/mpls/lfib/entry[label]/state. The vishvananda/netlink library
+// decodes the AF_MPLS routes for us: MPLSDst=incoming label, NewDst=swap label(s),
+// Via/Gw=next-hop, LinkIndex=out interface. Three shapes matter for path tracing:
+//   - swap:        NewDst set + next-hop set   (e.g. "18 as to 16 via …")
+//   - PHP pop:     NewDst nil + next-hop set   (e.g. "16 via …")
+//   - egress pop:  NewDst nil + next-hop nil   (e.g. "80 dev cust"  -> pop into VRF)
+func (n *Netlink) snapshotMPLS() {
+	routes, err := netlink.RouteList(nil, unix.AF_MPLS)
+	if err != nil {
+		return
+	}
+	cnt := 0
+	for _, r := range routes {
+		if r.MPLSDst == nil {
+			continue
+		}
+		label := uint32(*r.MPLSDst)
+		out := ""
+		if md, ok := r.NewDst.(*netlink.MPLSDestination); ok && md != nil {
+			out = intsCSV(md.Labels)
+		}
+		nh := ""
+		if via, ok := r.Via.(*netlink.Via); ok && via != nil && len(via.Addr) > 0 {
+			nh = net.IP(via.Addr).String()
+		} else if r.Gw != nil {
+			nh = r.Gw.String()
+		}
+		iface := ""
+		if r.LinkIndex > 0 {
+			if lk, err := netlink.LinkByIndex(r.LinkIndex); err == nil {
+				iface = lk.Attrs().Name
+			}
+		}
+		ups := []*gnmipb.Update{
+			leafUpdate(mplsElems(label, "in-label"), strconv.FormatUint(uint64(label), 10)),
+			leafUpdate(mplsElems(label, "out-label"), out),
+			leafUpdate(mplsElems(label, "next-hop"), nh),
+			leafUpdate(mplsElems(label, "interface"), iface),
+		}
+		_ = n.c.Update("frr", ups, nil)
+		cnt++
+	}
+	log.Printf("[netlink] mpls lfib snapshot: %d entries", cnt)
+}
+
+// snapshotAddrs exports each interface's IPv4 addresses under OpenConfig
+// /interfaces/interface[name]/subinterfaces/subinterface[index=0]/ipv4/addresses.
+// This lets a gNMI client map a data-plane next-hop IP back to the owning node
+// (e.g. path tracing) without logging into the box.
+func (n *Netlink) snapshotAddrs() {
+	links, err := netlink.LinkList()
+	if err != nil {
+		return
+	}
+	for _, l := range links {
+		addrs, err := netlink.AddrList(l, unix.AF_INET)
+		if err != nil {
+			continue
+		}
+		name := l.Attrs().Name
+		for _, a := range addrs {
+			if a.IPNet == nil {
+				continue
+			}
+			ip := a.IP.String()
+			pl, _ := a.Mask.Size()
+			ups := []*gnmipb.Update{
+				leafUpdate(addrElems(name, ip, "ip"), ip),
+				leafUpdate(addrElems(name, ip, "prefix-length"), strconv.Itoa(pl)),
+			}
+			_ = n.c.Update("openconfig", ups, nil)
+		}
 	}
 }
 
@@ -173,6 +252,8 @@ func (n *Netlink) snapshot() {
 	}
 	n.sampleCounters()
 	n.snapshotFDB()
+	n.snapshotMPLS()
+	n.snapshotAddrs()
 }
 
 // snapshotFDB dumps the existing bridge FDB so entries present before the shim
@@ -252,4 +333,46 @@ func fdbElems(mac, vlan, leaf string) []*gnmipb.PathElem {
 
 func uintVal(u uint64) *gnmipb.TypedValue {
 	return &gnmipb.TypedValue{Value: &gnmipb.TypedValue_UintVal{UintVal: u}}
+}
+
+// mplsElems: frr:/mpls/lfib/entry[label=N]/state/<leaf>
+func mplsElems(label uint32, leaf string) []*gnmipb.PathElem {
+	e := []*gnmipb.PathElem{
+		{Name: "mpls"},
+		{Name: "lfib"},
+		{Name: "entry", Key: map[string]string{"label": strconv.FormatUint(uint64(label), 10)}},
+	}
+	if leaf != "" {
+		e = append(e, &gnmipb.PathElem{Name: "state"}, &gnmipb.PathElem{Name: leaf})
+	}
+	return e
+}
+
+// addrElems: /interfaces/interface[name]/subinterfaces/subinterface[index=0]/ipv4/addresses/address[ip]/state/<leaf>
+func addrElems(ifname, ip, leaf string) []*gnmipb.PathElem {
+	e := []*gnmipb.PathElem{
+		{Name: "interfaces"},
+		{Name: "interface", Key: map[string]string{"name": ifname}},
+		{Name: "subinterfaces"},
+		{Name: "subinterface", Key: map[string]string{"index": "0"}},
+		{Name: "ipv4"},
+		{Name: "addresses"},
+		{Name: "address", Key: map[string]string{"ip": ip}},
+	}
+	if leaf != "" {
+		e = append(e, &gnmipb.PathElem{Name: "state"}, &gnmipb.PathElem{Name: leaf})
+	}
+	return e
+}
+
+// intsCSV renders an MPLS label list as "16" or "16,80" (top of stack first).
+func intsCSV(v []int) string {
+	s := ""
+	for i, x := range v {
+		if i > 0 {
+			s += ","
+		}
+		s += fmt.Sprintf("%d", x)
+	}
+	return s
 }

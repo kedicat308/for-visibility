@@ -397,8 +397,11 @@ ip addr add 10.0.30.1/24 dev swp3
     /mpls/signaling-protocols/ldp/...                # LDP 邻居/会话(标准部分)
     /mpls/lsps/...
     /afts/ipv4-unicast/ipv4-entry[prefix]            key=prefix    # per-VRF RIB/FIB
+        /state/{next-hop, pushed-mpls-label-stack}                 # push 栈=入口 PE 的 encap 标签(CSV)
     /afts/ipv6-unicast/ipv6-entry[prefix]
-    /afts/mpls/label-entry[label]                    key=label     # LFIB
+
+/interfaces/interface[name]/subinterfaces/subinterface[index]/ipv4/addresses/address[ip]
+    /state/{ip, prefix-length}                        key=ip        # 接口地址(ip→node 反查)
 
 /components/component[name]                          key=name      # CPU/内存的 OC 近似
     /cpu/utilization/state/{instant, avg}
@@ -413,6 +416,8 @@ ip addr add 10.0.30.1/24 dev swp3
 /l3vpn/vrf[name]                                     key=name
     /state/{rd, import-rt[], export-rt[], vpn-label, route-count}
 /mpls/ldp/binding[fec,label]                         key=(fec,label)   /state/{peer, in-label, out-label}
+/mpls/lfib/entry[label]                              key=label     # LFIB(全局标签交换表,path-trace 用)
+    /state/{in-label, out-label, next-hop, interface}              # out 空+nh空+if=VRF ⇒ egress pop 进 VRF
 /ospf/area[id]/state/spf/{count, last-duration-ms, last-run}
 ```
 
@@ -426,7 +431,8 @@ ip addr add 10.0.30.1/24 dev swp3
 | 2 | 端口流量 | `oc:/interfaces/interface/state/counters/*` | in/out-octets, pkts, errors, discards | netlink stats64 | **SAMPLE**(gauge,物理上无事件)|
 | 3 | VLAN | `oc:/network-instances/.../vlans/vlan`;`.../interface/ethernet/switched-vlan` | vlan-id, interface-mode, access/trunk | netlink AF_BRIDGE(bridge vlan) | ON_CHANGE |
 | 3 | FDB(MAC 表)| `oc:/network-instances/.../fdb/mac-table/entries/entry` | mac-address, interface, vlan | netlink AF_BRIDGE(FDB)| ON_CHANGE |
-| 4 | MPLS LFIB | `oc:/network-instances/.../afts/mpls/label-entry` | label, next-hop | 内核 netlink **AF_MPLS** | ON_CHANGE |
+| 4 | MPLS LFIB | `frr:/mpls/lfib/entry[label]/state/*`(已落地;规划曾为 `oc:.../afts/mpls/label-entry`,见 §15.4) | in/out-label, next-hop, interface | 内核 netlink **AF_MPLS** | SAMPLE 快照(可演进 ON_CHANGE)|
+| 4 | MPLS 压栈标签 | `oc:.../afts/ipv4-unicast/ipv4-entry[prefix]/state/pushed-mpls-label-stack` | 入口 PE push 栈 | **FPM** nexthop 对象 `NHA_ENCAP` | **ON_CHANGE**(FPM)|
 | 4 | LDP 邻居/绑定 | `oc:.../mpls/signaling-protocols/ldp` + `frr:/mpls/ldp/binding` | 邻居状态, in/out-label | ldpd(邻居=**syslog 事件**;绑定=低频 json 兜底)| 邻居 **ON_CHANGE**(syslog);绑定 SAMPLE |
 | 5 | OSPF 邻居 | `oc:/network-instances/.../protocols/protocol[OSPF]/ospfv2/.../neighbors/neighbor` | adjacency-state | ospfd **syslog / SNMP-trap**(事件);json 仅初始快照 | **ON_CHANGE**(syslog)|
 | 5 | OSPF 统计 | `frr:/ospf/area/state/spf/*` | spf count/duration | ospfd | SAMPLE |
@@ -594,4 +600,44 @@ path: ce1 -> pe1 -> p1 -> p2 -> pe2 -> ce4
 
 - **分工**:CE↔PE 纯 IP 边缘用 IP traceroute(可见);**MPLS 核心用控制面重建**。合起来是完整端到端 trace。
 - **gNOI Traceroute 的注意点**:若给 shim 实现 gNOI `System.Traceroute`(内部跑 `traceroute`),在 FRR 上核心会如实返回 `*`——这是 Linux MPLS 固有行为,不是 bug,须在文档写明。
-- **正版演进**:`pathtrace.sh` 现在是 `docker exec vtysh` 登设备读表;正版应**读 shim 的 gNMI**——AFT FIB(`openconfig:/network-instances/.../afts/.../next-hop`)与 MPLS 标签数据 shim 已在 cache 里,path-trace 即"节点接节点查 gNMI",与 cEOS 同接口,真正统一。这才是 Linux/FRR MPLS 上路径追踪的正确落地。
+- **正版演进**:`pathtrace.sh` 现在是 `docker exec vtysh` 登设备读表;正版应**读 shim 的 gNMI**——AFT FIB(`openconfig:/network-instances/.../afts/.../next-hop`)与 MPLS 标签数据 shim 已在 cache 里,path-trace 即"节点接节点查 gNMI",与 cEOS 同接口,真正统一。这才是 Linux/FRR MPLS 上路径追踪的正确落地。**已落地,见 §15.4。**
+
+### 15.4 trace 升级:从 vtysh 到 gNMI(2026-07-11,已实测)
+
+§15.3 的"正版演进"已实现。分两步:先给 shim 补齐 MPLS 转发面的导出(前提),再把 trace 改成纯 gNMI。
+
+**前提发现**:原 `fpm.go` 只导出 `afts/ipv4-unicast/ipv4-entry[prefix]/state/next-hop`——**没有压栈标签,也没有 LFIB(标签交换表)**。而 path-trace 恰恰走标签栈(pe1 `push 18/80`、p1 `swap 18→16`、p2 `PHP pop`、pe2 `pop 80→VRF`)。所以 gNMI 版 trace 建不起来,**必须先升级 shim**。好消息:数据本就到了 shim 门口(FPM 送 nexthop 对象 + 内核有 AF_MPLS 表),只是没解析。
+
+**Step A — shim 新增三项导出(代码)**:
+
+| 导出 | 路径 | 源 | 说明 |
+|------|------|-----|------|
+| IP 路由压栈标签 | `openconfig:.../afts/ipv4-unicast/ipv4-entry[prefix]/state/pushed-mpls-label-stack`(CSV,如 `18,80`) | FPM:`NHA_ENCAP`/`RTA_ENCAP`(MPLS)| 入口 PE 的 push 栈 |
+| MPLS LFIB(标签交换表)| `frr:/mpls/lfib/entry[label]/state/{in-label,out-label,next-hop,interface}` | 内核 netlink **AF_MPLS** 路由(`netlink` 库原生解析)| swap/PHP-pop/egress-pop 三态 |
+| 接口 IPv4 地址 | `openconfig:/interfaces/interface[name]/subinterfaces/subinterface[index=0]/ipv4/addresses/address[ip]/state/{ip,prefix-length}` | netlink `AddrList` | 让客户端把下一跳 IP 反查到节点,免登设备 |
+
+> **关键 bug(已修)**:内核对嵌套属性置 `NLA_F_NESTED (0x8000)` 标志位,故 `NHA_ENCAP(8)` 实际到达是 `0x8008`,原 `forEachAttr` 精确比较 `8` 永远不匹配,压栈标签一直为空。修法:`forEachAttr` 统一把类型与 `0x3fff` 掩码,剥掉 `NLA_F_NESTED`/`NLA_F_NET_BYTEORDER`。
+>
+> **LFIB 三态映射**(直接对应 `ip -f mpls route`):`out-label` 非空=**swap**;`out-label` 空 + `next-hop` 非空=**PHP pop**(隐式空标签);`out-label` 空 + `next-hop` 空 + `interface`=VRF 名=**egress pop 进 VRF**。
+>
+> **模型偏差(诚实记录)**:§12.2/12.3 曾把 LFIB 规划到 `oc:.../afts/mpls/label-entry`、ON_CHANGE。实际落地为 `frr:/mpls/lfib/entry`(LFIB 是全局表、不是 per-VRF,放 `frr` origin 更贴切)、SAMPLE 快照(LFIB 变动少,快照够用;后续可换 `RTNLGRP_MPLS_ROUTE` 订阅改 ON_CHANGE)。
+
+**Step B — `lab/pathtrace-gnmi.sh`(纯 gNMI,不登设备)**:同一套标签栈状态机,但每一跳都是对该节点**管理地址**发 `gnmic get`——与 trace cEOS 完全同接口。两个设计点:
+
+- **VRF 搜索交给服务端**:用 `network-instance[name=*]` 通配一次查所有 VRF,命中哪个 VRF 由返回的 path key 自带,tracer **完全不需要跟踪 VRF 上下文**。
+- **LPM 放客户端**:gNMI key 是精确匹配、不做最长前缀匹配,故脚本把返回的所有 `ipv4-entry` 在本地做 LPM。
+
+**实测结果**(8 节点 veth 拓扑,ce1→ce4,耗时 0.26s):
+
+```
+ce1   IP/default            -> 10.0.21.1  (10.255.1.4/32)
+pe1   IP/cust   push[18,80]  -> 10.0.12.2  (10.255.1.4/32)
+p1    MPLS      swap 18->16   -> 10.0.13.2  (p1-p2)   stack[16 80]
+p2    MPLS      pop 16   (PHP) -> 10.0.14.2  (p2-pe2)   stack[80]
+pe2   MPLS      pop 80   -> VRF cust
+pe2   IP/cust              -> 10.0.24.2  (10.255.1.4/32)
+ce4   [dest]       destination reached
+path:  ce1 -> pe1 -> p1 -> p2 -> pe2 -> ce4
+```
+
+与 vtysh 版 `pathtrace.sh` 逐跳一致,双向对称(反向 ce4→ce1 用标签 19→16)。`pathtrace.sh`(登设备)保留为离线兜底,`pathtrace-gnmi.sh` 是统一的、免登设备的正版。

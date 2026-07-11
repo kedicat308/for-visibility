@@ -60,7 +60,8 @@ ospfd ─ syslog ─────────────────┘
   - `config-l3vpn.sh` — OSPF+LDP core, iBGP VPNv4, VRF cust, PE-CE eBGP (protocols, run after build); `check-topo.sh` — convergence check
   - `deploy-shim.sh` — compile + embed the shim into all 8, wire FPM/BMP/OSPF-syslog, install lldpd, bridge/FDB
   - `gnmic-frr.yaml` — gnmic collector (shim gNMI → Prometheus :9806); `frr-visible-dashboard.json` — Grafana dashboard; `setup-telemetry.sh` — wiring
-  - `pathtrace.sh` — control-plane path trace (walks FIB/LFIB hop-by-hop with the label stack; sees the MPLS core that IP traceroute can't — see `design.md` §15)
+  - `pathtrace.sh` — control-plane path trace via `vtysh` (walks FIB/LFIB hop-by-hop with the label stack; sees the MPLS core that IP traceroute can't — see `design.md` §15)
+  - `pathtrace-gnmi.sh` — the same trace sourced **entirely from the shim's gNMI** (no device login; reads AFT push-labels + `frr:/mpls/lfib` + interface addresses) — like tracing across cEOS; see `design.md` §15.4
 
 ## Build / Run / 构建·运行
 
@@ -99,7 +100,8 @@ bash lab/deploy-shim.sh     # build + embed shim in all 8, install lldpd, bridge
 bash lab/setup-telemetry.sh # gnmic-frr -> Prometheus -> Grafana
 # open http://localhost:3000/d/frr-visible
 
-bash lab/pathtrace.sh ce1 10.255.1.4   # control-plane path trace ce1 -> ce4 (shows the MPLS core)
+bash lab/pathtrace.sh ce1 10.255.1.4        # control-plane path trace ce1 -> ce4 (via vtysh)
+bash lab/pathtrace-gnmi.sh ce1 10.255.1.4   # same trace, sourced entirely from the shim's gNMI (no device login)
 ```
 
 All 8 metric categories carry real data on a coherent topology; the dashboard has a `$node` filter and panels for CPU/mem, interface rate + state timeline, OSPF/BGP/LLDP neighbor tables, and L3VPN / FIB / FDB tables. See `design.md` §14 for the full write-up (incl. the 3 shim bug-fixes and the environment gotchas).
