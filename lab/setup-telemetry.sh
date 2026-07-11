@@ -62,6 +62,19 @@ docker run -d --name trace-aggregator --network frr-mgmt --ip 172.31.0.32 \
 docker network connect campus-mgmt trace-aggregator --ip 172.30.30.22
 echo "trace-aggregator started (frr-mgmt 172.31.0.32 + campus-mgmt 172.30.30.22 -> Tempo)"
 
+# 1e. topology-exporter — reads each shim's gNMI directly and emits the 4-layer
+#     topology (physical/ospf/bgp/mpls) as Node-Graph-ready Prometheus metrics.
+#     Dual-homed like the others (frr-mgmt to reach shims, campus-mgmt to scrape).
+( cd "$SRC" && CGO_ENABLED=0 GOFLAGS=-buildvcs=false go build -o /tmp/topology-exporter ./cmd/topology-exporter )
+docker rm -f topology-exporter >/dev/null 2>&1 || true
+docker run -d --name topology-exporter --network frr-mgmt --ip 172.31.0.33 \
+  -v /tmp/topology-exporter:/topology-exporter:ro \
+  -e INVENTORY="$INV" -e INTERVAL=15s -e LISTEN=":9810" \
+  --entrypoint /topology-exporter --restart unless-stopped \
+  ghcr.io/openconfig/gnmic:latest >/dev/null
+docker network connect campus-mgmt topology-exporter --ip 172.30.30.23
+echo "topology-exporter started (frr-mgmt 172.31.0.33 + campus-mgmt 172.30.30.23)"
+
 # 2. Prometheus scrape job for gnmic-frr (idempotent)
 if ! grep -q "gnmic-frr" "$TELEM/prometheus.yml"; then
   cat >> "$TELEM/prometheus.yml" <<'EOF'
@@ -84,6 +97,16 @@ if ! grep -q "pathtrace-exporter" "$TELEM/prometheus.yml"; then
       - targets: ['pathtrace-exporter:9808']
 EOF
   echo "added pathtrace-exporter scrape job"
+fi
+if ! grep -q "topology-exporter" "$TELEM/prometheus.yml"; then
+  cat >> "$TELEM/prometheus.yml" <<'EOF'
+
+  # multi-layer topology (frr-visible)
+  - job_name: topology-exporter
+    static_configs:
+      - targets: ['topology-exporter:9810']
+EOF
+  echo "added topology-exporter scrape job"
 fi
 
 # 3. Provision the dashboard into Grafana

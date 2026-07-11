@@ -17,6 +17,20 @@
         "includeAll": true,
         "multi": true,
         "current": { "text": "All", "value": "$__all" }
+      },
+      {
+        "name": "layer",
+        "label": "拓扑层 / topology layer",
+        "type": "custom",
+        "query": "physical,vlan,ospf,bgp,mpls",
+        "options": [
+          { "text": "physical", "value": "physical", "selected": true },
+          { "text": "vlan", "value": "vlan", "selected": false },
+          { "text": "ospf", "value": "ospf", "selected": false },
+          { "text": "bgp", "value": "bgp", "selected": false },
+          { "text": "mpls", "value": "mpls", "selected": false }
+        ],
+        "current": { "text": "physical", "value": "physical" }
       }
     ]
   },
@@ -191,6 +205,18 @@
       "id": 55, "type": "text", "title": "跨设备收敛瀑布 (Tempo) / how to view",
       "gridPos": { "h": 3, "w": 24, "x": 0, "y": 82 },
       "options": { "mode": "markdown", "content": "上表点 **Trace ID** 展开跨设备 span 瀑布(pe1 -> p1 -> ... -> ce 的收敛时间线);若表为空,点这里 [在 Explore 打开 Tempo](/explore) -> 选 **Tempo** 数据源 -> TraceQL 输入 `{}` -> 点任一 trace。" }
+    },
+    { "type": "row", "title": "拓扑 · 多层节点图 (物理/VLAN/OSPF/BGP/MPLS,源自 gNMI)", "gridPos": { "h": 1, "w": 24, "x": 0, "y": 85 }, "id": 59 },
+    {
+      "id": 60, "type": "nodeGraph", "title": "Topology — $layer 层 / 多层拓扑",
+      "description": "同一批节点上的多层拓扑,数据来自 topology-exporter(直读各 shim gNMI):physical=LLDP 邻接, vlan=bridge/FDB 二层域, ospf=IGP 邻接, bgp=BGP 会话(iBGP 是跨核心逻辑边), mpls=LFIB 标签交换段。用左上角 layer 变量切换。",
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "gridPos": { "h": 15, "w": 24, "x": 0, "y": 86 },
+      "targets": [
+        { "refId": "nodes", "expr": "frr_topo_node{layer=\"$layer\"}", "instant": true, "format": "table" },
+        { "refId": "edges", "expr": "frr_topo_edge{layer=\"$layer\"}", "instant": true, "format": "table" }
+      ],
+      "transformations": [ { "id": "organize", "options": { "excludeByName": { "Time": true, "Value": true, "__name__": true, "job": true, "instance": true, "layer": true }, "renameByName": { "role": "mainstat", "detail": "mainstat" } } } ]
     }
   ]
 }
